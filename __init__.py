@@ -12,3 +12,13 @@ def register(ctx) -> None:
         relink_watcher.start(_HUB_SYNC)
     except Exception as e:  # pragma: no cover - defensive
         print(f"[whatsapp-listener] relink watcher not started (ignored): {e}")
+
+    # Start the live-push WebSocket to the hub: a daemon thread that pushes small
+    # "chat changed" + status events UP so an open hub tab updates in real time
+    # (docs live-push-design.md, step 2). Best-effort; on standalone boxes (no hub)
+    # or if `websockets` is unavailable it simply no-ops.
+    try:
+        from . import hub_push
+        hub_push.start(_HUB_SYNC)
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[whatsapp-listener] hub push not started (ignored): {e}")

@@ -500,6 +500,14 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
         # sender_name (pushName) is used for DMs; groups resolve their subject.
         _hub_backfill_name(chat_id, sender_name=user_name)
 
+        # Live push: nudge the hub that this chat changed so an open tab refetches
+        # in real time (docs live-push-design.md). Fire-and-forget; never fatal.
+        try:
+            from . import hub_push
+            hub_push.notify_new_message(chat_id)
+        except Exception:
+            pass
+
         adapter = gateway.adapters.get(Platform.WHATSAPP)
 
         # Apply profile-scoped monkey-patch to filter out transcription echoes dynamically and bubble errors

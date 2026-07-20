@@ -208,6 +208,15 @@ def push_status(status, qr=None, bot_user=None):
         body["botUser"] = bot_user
     threading.Thread(target=_post_status, args=(body,), daemon=True).start()
 
+    # Also mirror over the live-push WebSocket (best-effort) so an open hub tab
+    # flips the status pill instantly, not on its next poll. HTTP above stays the
+    # source of truth for persistence; this is a fast-path notification only.
+    try:
+        import hub_push  # type: ignore
+        hub_push.push_status(status, qr=qr, bot_user=bot_user)
+    except Exception:
+        pass
+
 
 def push_state_section(section, jids, source="plugin"):
     """Push a whole list-section as booleans for the given jids (used right after
