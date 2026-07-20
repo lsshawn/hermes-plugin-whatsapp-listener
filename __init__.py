@@ -1,0 +1,14 @@
+def register(ctx) -> None:
+    from .plugin import on_pre_gateway_dispatch, _HUB_SYNC
+    ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
+
+    # Start the WhatsApp relink watcher: a daemon thread that heartbeats the
+    # bridge's connection status to the hub and auto-surfaces a relink QR when the
+    # bot is logged out. Best-effort and never fatal — if it can't start, the
+    # plugin's message handling is unaffected. On standalone boxes (no hub) the
+    # watcher still runs; its status pushes simply no-op.
+    try:
+        from . import relink_watcher
+        relink_watcher.start(_HUB_SYNC)
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[whatsapp-listener] relink watcher not started (ignored): {e}")

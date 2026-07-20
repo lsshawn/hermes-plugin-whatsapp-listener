@@ -1,0 +1,25 @@
+# whatsapp-listener state — copy to state.yaml and edit. The bot manages most of
+# this at runtime via in-chat commands; you only need to set root_admin to start.
+#
+#   cp state.yaml.example state.yaml
+#
+# root_admin: your WhatsApp number — the permanent admin, never removable.
+root_admin: YOUR_NUMBER@s.whatsapp.net
+
+# Extra admins (managed with /admin add|remove).
+admins: []
+
+# Chats the bot REPLIES in (managed with /whitelist add|remove). Messages from
+# other chats are still saved silently for context, just not answered.
+reply_whitelist: []
+
+# Groups exempt from the @mention requirement (managed with /no-mention add|remove).
+# Whitelisted GROUPS require a direct @mention by default; listed groups reply
+# without one. Requires core config.yaml `whatsapp.require_mention: false`.
+no_mention_groups: []
+
+# Groups where ops/slash commands are allowed.
+admin_groups: null
+
+# Chat -> reason, managed by pause/resume + handoff. Leave empty.
+paused_chats: {}

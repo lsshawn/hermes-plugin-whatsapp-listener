@@ -1,0 +1,6 @@
+name: whatsapp-listener
+version: 1.0.0
+description: "Silent Listener mode for WhatsApp. Saves messages to the database but skips LLM execution unless whitelisted."
+author: "Hermes"
+hooks:
+  - pre_gateway_dispatch
