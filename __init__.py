@@ -2,6 +2,15 @@ def register(ctx) -> None:
     from .plugin import on_pre_gateway_dispatch, _HUB_SYNC
     ctx.register_hook("pre_gateway_dispatch", on_pre_gateway_dispatch)
 
+    # Human-in-the-loop handoff: intercept the AI's reply, and on low confidence
+    # create a ticket + post to the admin group instead of auto-sending. Best-effort
+    # — if it can't import/register, normal replies are unaffected.
+    try:
+        from .handoff import transform_llm_output
+        ctx.register_hook("transform_llm_output", transform_llm_output)
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[whatsapp-listener] handoff hook not registered (ignored): {e}")
+
     # Start the WhatsApp relink watcher: a daemon thread that heartbeats the
     # bridge's connection status to the hub and auto-surfaces a relink QR when the
     # bot is logged out. Best-effort and never fatal — if it can't start, the

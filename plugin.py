@@ -700,7 +700,19 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             import re
             text_strip = text.strip()
             text_lower = text_strip.lower()
-            
+
+            # HANDOFF RESOLVE: if this is an admin quote-reply to an open handoff
+            # card, send the answer to the customer and stop. Correlated by message
+            # id (quotedMessageId == ticket.handoffMsgId), not by parsing text.
+            try:
+                from .handoff import try_resolve_from_quote
+                _resolve_status = try_resolve_from_quote(event)
+                if _resolve_status:
+                    send_msg(_resolve_status)
+                    return {"action": "skip", "reason": "Resolved handoff ticket from admin quote-reply"}
+            except Exception as _e:
+                print(f"[whatsapp-listener] handoff resolve intercept failed (ignored): {_e}")
+
             # Match resume to a titled session: "resume <client> <session_title>" or "/resume <client> <session_title>"
             # Note: We must check this BEFORE the standard resume_match because resume_match would greedily consume the title as part of the client name!
             resume_session_match = re.match(r"^(?:/)?(?:resume|unpause)\s+(\S+)\s+(.+)$", text_strip, re.IGNORECASE)
