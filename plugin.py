@@ -500,11 +500,14 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
         # sender_name (pushName) is used for DMs; groups resolve their subject.
         _hub_backfill_name(chat_id, sender_name=user_name)
 
-        # Live push: nudge the hub that this chat changed so an open tab refetches
-        # in real time (docs live-push-design.md). Fire-and-forget; never fatal.
+        # Live push: send the just-arrived inbound message to the hub so an open tab
+        # renders it INSTANTLY (no follow-up GET). Advisory preview — the hub
+        # reconciles to the canonical state.db row later. `text` may be empty for
+        # media/voice; the hub shows a placeholder and the fetch fills it in.
+        # Fire-and-forget; never fatal (docs live-push-design.md).
         try:
             from . import hub_push
-            hub_push.notify_new_message(chat_id)
+            hub_push.notify_new_message(chat_id, text=text, role="user")
         except Exception:
             pass
 

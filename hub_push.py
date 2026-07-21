@@ -85,13 +85,38 @@ def _enqueue(kind, data):
 
 # --- public, thread-safe entry points --------------------------------------
 
-def notify_new_message(chat_id):
-    """A message arrived in `chat_id` — nudge the hub to refetch that chat.
-    Lightweight by design (no message body): avoids Python<->TS payload drift and
-    handles media for free. Called from the gateway's inbound message hook."""
+# Monotonic synthetic ids for pushed message previews: NEGATIVE so they never
+# collide with real state.db row ids (positive). The hub renders the preview
+# instantly and reconciles to the real row on the next fetch. Guarded by a lock
+# since notify_new_message is called from the gateway's message-hook thread.
+_syn_lock = threading.Lock()
+_syn_id = 0
+
+
+def _next_syn_id():
+    global _syn_id
+    with _syn_lock:
+        _syn_id -= 1
+        return _syn_id
+
+
+def notify_new_message(chat_id, text=None, role="user", ts=None):
+    """An inbound message arrived in `chat_id` — push it to the hub for instant,
+    GET-free rendering. `text` (the message body) is OPTIONAL: when present the hub
+    appends it immediately; when absent this degrades to a bare nudge and the hub
+    does a targeted fetch. The preview is advisory (synthetic negative id), so the
+    canonical state.db row reconciles it later. Called from the inbound hook."""
     if not chat_id:
         return
-    _enqueue("new_message", {"chatId": str(chat_id)})
+    data = {"chatId": str(chat_id)}
+    if text is not None:
+        data["message"] = {
+            "id": _next_syn_id(),
+            "role": role,
+            "content": text,
+            "timestamp": int(ts if ts is not None else time.time()),
+        }
+    _enqueue("new_message", data)
 
 
 def push_status(status, qr=None, bot_user=None):
