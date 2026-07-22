@@ -64,6 +64,84 @@ except Exception as _e:
     _HUB_SYNC = None
 
 
+# --- multiplex profile resolution -------------------------------------------
+# The listener runs in pre_gateway_dispatch, BEFORE the gateway's own routing.
+# When it creates/touches a session with a bare build_session_key() (no profile)
+# it lands in the DEFAULT `agent:main` namespace + default state.db. Under
+# gateway.multiplex_profiles that PRE-CREATES the wrong session for a routed
+# group, so the agent then runs as DEFAULT (with default's skills/memory/creds)
+# instead of the routed profile — the root cause of cross-profile data leaks.
+# These helpers let the listener resolve the routed profile the SAME way the
+# gateway does, so its session key + DB write match the gateway's.
+_LISTENER_ROUTES_CACHE = {"key": None, "map": {}}
+
+
+def _multiplex_on() -> bool:
+    try:
+        import yaml
+        cfg = yaml.safe_load(open(os.path.join(
+            os.path.expanduser("~/.hermes"), "config.yaml"))) or {}
+        gw = cfg.get("gateway")
+        return bool(isinstance(gw, dict) and gw.get("multiplex_profiles"))
+    except Exception:
+        return False
+
+
+def _profile_for_chat(chat_id: str) -> str:
+    """Return the profile a chat_id routes to (from config.yaml profile_routes),
+    or 'default'. Cached on config.yaml mtime. WhatsApp routes only."""
+    if not chat_id:
+        return "default"
+    cfg_path = os.path.join(os.path.expanduser("~/.hermes"), "config.yaml")
+    try:
+        mtime = os.stat(cfg_path).st_mtime_ns
+    except OSError:
+        return "default"
+    if _LISTENER_ROUTES_CACHE["key"] != mtime:
+        m = {}
+        try:
+            import yaml
+            cfg = yaml.safe_load(open(cfg_path)) or {}
+            gw = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
+            for r in (gw.get("profile_routes") or []):
+                if not isinstance(r, dict):
+                    continue
+                plat = (r.get("platform") or "").lower()
+                if plat and plat not in ("whatsapp", "whatsapp_cloud"):
+                    continue
+                cid, prof = r.get("chat_id"), r.get("profile")
+                if cid and prof:
+                    m[str(cid)] = str(prof)
+        except Exception:
+            m = {}
+        _LISTENER_ROUTES_CACHE["key"] = mtime
+        _LISTENER_ROUTES_CACHE["map"] = m
+    return _LISTENER_ROUTES_CACHE["map"].get(chat_id, "default")
+
+
+def _profile_key_kwarg(chat_id: str) -> dict:
+    """{'profile': <name>} for build_session_key when multiplex routes this chat;
+    empty dict otherwise (so single-profile behavior is byte-identical)."""
+    if not _multiplex_on():
+        return {}
+    prof = _profile_for_chat(chat_id)
+    return {"profile": prof} if prof and prof != "default" else {}
+
+
+def _scoped_session_db(chat_id: str):
+    """A SessionDB pointed at the routed profile's state.db (so the listener's
+    silent-save writes to the SAME db the gateway will use), or the default DB."""
+    from hermes_state import SessionDB
+    if _multiplex_on():
+        prof = _profile_for_chat(chat_id)
+        if prof and prof != "default":
+            from pathlib import Path
+            pdir = Path(os.path.expanduser("~/.hermes")) / "profiles" / prof
+            if pdir.is_dir():
+                return SessionDB(db_path=pdir / "state.db")
+    return SessionDB()
+
+
 def _hub_flag_for(section):
     if _HUB_SYNC is None:
         return None
@@ -1440,24 +1518,60 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 user_id=user_id,
                 chat_type="group" if is_group else "dm"
             )
+            # MULTIPLEX FIX: stamp the routed profile so the session key lands
+            # in the correct namespace (agent:<profile>) and the gateway reuses
+            # THIS session instead of a default one. Also stamp source.profile
+            # so get_or_create_session/store agree.
+            _pk = _profile_key_kwarg(chat_id)
+            if _pk:
+                try:
+                    safe_source.profile = _pk["profile"]
+                except Exception:
+                    pass
             session_key = build_session_key(
                 safe_source,
                 group_sessions_per_user=getattr(gateway.config, "extra", {}).get("group_sessions_per_user", True),
                 thread_sessions_per_user=getattr(gateway.config, "extra", {}).get("thread_sessions_per_user", False),
+                **_pk,
             )
         except Exception:
             safe_source = None
 
         if not safe_source:
             return {"action": "skip", "reason": "Failed to create SessionSource"}
-        
-        session_entry = session_store.get_or_create_session(safe_source)
-        
+
+        # Use scoped DB (routed profile's state.db) for BOTH session creation
+        # AND message appending. Previously session_store.get_or_create_session()
+        # always hit the default profile's state.db, leaking default memory/history
+        # (IBKR, agenda, etc.) into routed cgpt/yltc chats.
+        db = _scoped_session_db(chat_id)
         try:
-            from hermes_state import SessionDB
-            db = SessionDB()
+            # Look up existing session by session_key in the scoped DB.
+            source_str = f"whatsapp:{chat_id}"
+            row = db.find_session_by_peer(
+                source=source_str,
+                session_key=session_key,
+                chat_id=chat_id,
+                chat_type="group" if is_group else "dm",
+            )
+            if row:
+                session_id = row["id"]
+            else:
+                # Create a new session in the scoped DB.
+                import uuid
+                from datetime import datetime
+                now = datetime.utcnow()
+                session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+                db.create_session(
+                    session_id,
+                    source_str,
+                    session_key=session_key,
+                    chat_id=chat_id,
+                    chat_type="group" if is_group else "dm",
+                    user_id=user_id,
+                )
             db.append_message(
-                session_id=session_entry.session_id,
+                session_id=session_id,
                 role="user",
                 content=text
             )

@@ -56,6 +56,117 @@ _name_cache = {}          # jid -> resolved name (avoids re-hitting the local en
 _name_cache_lock = threading.Lock()
 
 
+# --- profile routing (config.yaml gateway.profile_routes) -------------------
+# The client's Hermes multiplexes one WhatsApp gateway across several profiles
+# (cgpt, yltc, ...). Routing lives in ~/.hermes/config.yaml under
+# `gateway.profile_routes` (native, once multiplexing is enabled). We READ it —
+# never write it: config.yaml is authoritative and hand-edited on the client.
+#
+# What we can map RELIABLY is GROUP jids (@g.us): a route keys on a group's
+# chat_id, so a group belongs to exactly one profile. Individual jids
+# (@s.whatsapp.net / @lid) have no route of their own and may appear across
+# groups in DIFFERENT profiles — so we emit NO profile claim for them and let
+# the hub derive per-chat profile from its own chat/session data. Hence the
+# wire carries `profiles` as a LIST (0..n), never a single value.
+#
+# Migration window: before you move the mappings into config.yaml, fall back to
+# the legacy whatsapp-profile-router/profile_routes.json so nothing goes blank.
+HERMES_HOME = os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
+CONFIG_YAML = os.path.join(HERMES_HOME, "config.yaml")
+LEGACY_ROUTES_JSON = os.path.join(
+    HERMES_HOME, "plugins", "whatsapp-profile-router", "profile_routes.json"
+)
+
+_routes_cache = {}        # {chat_id: profile}
+_routes_cache_key = None  # (config_mtime, legacy_mtime) — reparse only on change
+_routes_lock = threading.Lock()
+
+
+def _mtime(path):
+    try:
+        return os.stat(path).st_mtime_ns
+    except OSError:
+        return 0
+
+
+def _parse_config_routes():
+    """Return {chat_id: profile} from config.yaml gateway.profile_routes.
+
+    Only WhatsApp routes keyed on a concrete chat_id are usable here (group
+    jids). Routes without chat_id (e.g. Discord guild-only) are skipped."""
+    try:
+        import yaml
+        with open(CONFIG_YAML, "r", encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception:
+        return {}
+    gw = cfg.get("gateway")
+    raw = gw.get("profile_routes") if isinstance(gw, dict) else None
+    if not raw and isinstance(cfg.get("profile_routes"), list):
+        raw = cfg.get("profile_routes")  # tolerate a top-level form too
+    out = {}
+    for entry in raw or []:
+        if not isinstance(entry, dict):
+            continue
+        platform = (entry.get("platform") or "").lower()
+        if platform and platform not in ("whatsapp", "whatsapp_cloud"):
+            continue
+        chat_id = entry.get("chat_id")
+        profile = entry.get("profile")
+        if chat_id and profile:
+            out[str(chat_id)] = str(profile)
+    return out
+
+
+def _parse_legacy_routes():
+    """Return {chat_id: profile} from the old profile_routes.json (fallback)."""
+    try:
+        with open(LEGACY_ROUTES_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return {}
+    out = {}
+    if isinstance(data, dict):
+        for chat_id, meta in data.items():
+            profile = (meta or {}).get("profile") if isinstance(meta, dict) else None
+            if chat_id and profile:
+                out[str(chat_id)] = str(profile)
+    return out
+
+
+def load_routes():
+    """{chat_id: profile}, cached and reparsed only when a source file changes.
+    config.yaml wins; legacy JSON fills gaps during the migration window."""
+    global _routes_cache, _routes_cache_key
+    key = (_mtime(CONFIG_YAML), _mtime(LEGACY_ROUTES_JSON))
+    with _routes_lock:
+        if key == _routes_cache_key:
+            return _routes_cache
+        merged = dict(_parse_legacy_routes())  # base
+        merged.update(_parse_config_routes())  # config.yaml overrides
+        _routes_cache = merged
+        _routes_cache_key = key
+        return merged
+
+
+def profiles_for_jid(jid):
+    """Profiles a jid maps to, as a list (0..n).
+
+    Group jids resolve to their single routed profile. Individual jids get an
+    empty list — hub-sync can't know their profile set, so the hub derives it.
+    """
+    if not jid:
+        return []
+    routes = load_routes()
+    prof = routes.get(jid)
+    return [prof] if prof else []
+
+
+def distinct_profiles():
+    """All profile names referenced by any route (for the profiles reconcile)."""
+    return sorted({p for p in load_routes().values() if p})
+
+
 def enabled():
     return _enabled
 
@@ -170,6 +281,14 @@ def push_deltas(deltas, source="plugin", resolve_names=True):
             n = resolve_name(d["jid"])
             if n:
                 d["name"] = n
+        # Tag with the routed profile(s). A list (0..n): group jids resolve to
+        # one profile; individual jids stay empty (hub derives per-chat). Only
+        # attach when non-empty so we never overwrite a hub-derived value with
+        # "no opinion". Older hubs simply ignore the field.
+        if not d.get("profiles"):
+            profs = profiles_for_jid(d.get("jid"))
+            if profs:
+                d["profiles"] = profs
         prepared.append(d)
     threading.Thread(target=_post_deltas, args=(prepared, source), daemon=True).start()
 
@@ -326,3 +445,37 @@ def push_full_state(state_file=None, source="plugin"):
         e["pauseReason"] = reason
     if by_jid:
         push_deltas(list(by_jid.values()), source=source, resolve_names=False)
+
+
+# --- profiles reconcile (plugin -> hub) ------------------------------------
+
+def _post_profiles(body):
+    try:
+        _request("POST", "/api/v1/profiles", body=body)
+    except Exception as e:
+        # Best effort; the hub simply keeps its last-known profile table. Older
+        # hubs without this route 404 — swallowed here, never propagated.
+        print("[hub_sync] profiles push failed (ignored):", e)
+
+
+def push_profiles(source="plugin"):
+    """Reconcile: report the full profile picture from config.yaml routes so the
+    hub can render a profile filter/switcher (even for a profile with no synced
+    contacts yet) and derive per-chat profiles authoritatively.
+
+    Sends both the distinct profile list and the raw chat_id -> profile routes.
+    Fire-and-forget; called occasionally by the cron (like push_full_state),
+    never on the hot path. No-op if hub-sync isn't configured or no routes
+    exist. config.yaml stays authoritative — this only READS it."""
+    if not _enabled:
+        return
+    routes = load_routes()
+    body = {
+        "source": source,
+        "updatedAt": int(time.time()),
+        "profiles": distinct_profiles(),
+        "routes": [{"chatId": c, "profile": p} for c, p in sorted(routes.items())],
+    }
+    if not body["profiles"] and not body["routes"]:
+        return
+    threading.Thread(target=_post_profiles, args=(body,), daemon=True).start()
