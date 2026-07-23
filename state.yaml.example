@@ -1,25 +1,43 @@
-# whatsapp-listener state — copy to state.yaml and edit. The bot manages most of
-# this at runtime via in-chat commands; you only need to set root_admin to start.
+# DEPRECATED — state.yaml is retired.
 #
-#   cp state.yaml.example state.yaml
+# Per-chat WhatsApp config now lives in ~/.hermes/config.yaml as the SINGLE
+# source of truth (DRY). This file is kept only as a schema reference. The
+# plugin no longer reads or writes state.yaml.
 #
-# root_admin: your WhatsApp number — the permanent admin, never removable.
-root_admin: YOUR_NUMBER@s.whatsapp.net
-
-# Extra admins (managed with /admin add|remove).
-admins: []
-
-# Chats the bot REPLIES in (managed with /whitelist add|remove). Messages from
-# other chats are still saved silently for context, just not answered.
-reply_whitelist: []
-
-# Groups exempt from the @mention requirement (managed with /no-mention add|remove).
-# Whitelisted GROUPS require a direct @mention by default; listed groups reply
-# without one. Requires core config.yaml `whatsapp.require_mention: false`.
-no_mention_groups: []
-
-# Groups where ops/slash commands are allowed.
-admin_groups: null
-
-# Chat -> reason, managed by pause/resume + handoff. Leave empty.
-paused_chats: {}
+# WHERE THINGS LIVE NOW
+# ---------------------
+# 1) Operator identity  ->  top-level `whatsapp_admins` in config.yaml:
+#
+#      whatsapp_admins:
+#        root: YOUR_NUMBER@s.whatsapp.net   # permanent admin, never removable
+#        extra: []                          # managed by /admin add|remove
+#
+# 2) Per-chat behaviour  ->  fields ON each chat's route under
+#    `gateway.profile_routes` in config.yaml:
+#
+#      gateway:
+#        profile_routes:
+#          - name: cgpt-5
+#            platform: whatsapp
+#            chat_id: 120363406938117817@g.us
+#            profile: cgpt
+#            reply: true          # was reply_whitelist  (/whitelist add|remove)
+#            no_mention: false    # was no_mention_groups (/no-mention add|remove)
+#            paused: false        # was paused_chats MANUAL pause (pause/resume)
+#            pause_reason: ""      # optional label when paused: true
+#
+#    Field semantics (unchanged behaviour):
+#      - reply: true       -> bot replies here (else silent-save only).
+#      - no_mention: true  -> group replies WITHOUT an @mention (needs reply:true
+#                             + a group + core whatsapp.require_mention: false).
+#      - paused: true      -> MANUAL pause. Automated handoff-pause is separate
+#                             and still derived live from concierge.db.
+#      - profile           -> which bot serves the chat. Now HOT: the listener
+#                             stamps source.profile from a live config.yaml
+#                             re-read, so moving a chat's profile needs NO restart.
+#
+# admin_groups is DROPPED — admins are resolved by identity and can run ops
+# commands anywhere.
+#
+# All of the above is managed at runtime by in-chat commands (and by cupbots-hub),
+# which write config.yaml atomically via config_routes.py (ruamel, comment-safe).

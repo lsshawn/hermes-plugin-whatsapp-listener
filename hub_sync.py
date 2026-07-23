@@ -349,100 +349,136 @@ def push_state_section(section, jids, source="plugin"):
     push_deltas(deltas, source=source)
 
 
-# --- pull (hub -> plugin), applied to state.yaml ---------------------------
+# --- pull (hub -> plugin), applied to config.yaml --------------------------
+# DRY: the hub now reads/writes the SAME single source as the plugin and the
+# gateway — config.yaml gateway.profile_routes + whatsapp_admins — via the
+# plugin's config_routes.py atomic ruamel writer. state.yaml is retired.
 
-def _load_yaml(path):
-    import yaml
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
-
-
-def _dump_yaml(path, data):
-    """Write state.yaml preserving the section order the plugin expects."""
-    import yaml
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, sort_keys=False, allow_unicode=True, default_flow_style=False)
-    os.replace(tmp, path)  # atomic
+def _config_routes():
+    """Import the plugin's config_routes module (in-package). Returns None if
+    unavailable so callers can no-op gracefully."""
+    try:
+        from . import config_routes as _cr  # normal in-package import
+        return _cr
+    except Exception:
+        try:
+            import config_routes as _cr  # fallback when run as a loose module
+            return _cr
+        except Exception:
+            return None
 
 
 def pull_and_apply(state_file=None):
-    """Fetch the hub's merged contact map and rewrite the managed state.yaml
-    sections. Returns a summary dict, or {'ok': False} on any failure (in which
-    case state.yaml is left UNTOUCHED — the bot keeps its last-known config).
+    """Fetch the hub's merged contact map and reconcile it into config.yaml
+    gateway.profile_routes (reply/no_mention/paused/pause_reason) + whatsapp_admins
+    (extra). Also honors a per-contact `profile` so the hub can MOVE a chat's
+    profile (the end goal). Returns a summary dict, or {'ok': False} on any failure
+    (config.yaml is left UNTOUCHED — the bot keeps its last-known config).
 
-    Managed sections: reply_whitelist, no_mention_groups, admins (lists) and
-    paused_chats (dict jid->reason). `root_admin` and any other keys are preserved
-    verbatim — never touched by the hub."""
-    path = state_file or STATE_FILE
-    if not _enabled or not path:
+    Per-chat fields live on the route entry keyed by chat_id. Admin identity
+    (root/extra) lives in whatsapp_admins; root is never overwritten by the hub.
+    `state_file` is accepted for signature compatibility but ignored."""
+    if not _enabled:
         return {"ok": False, "reason": "not-configured"}
+    cr = _config_routes()
+    if cr is None:
+        return {"ok": False, "reason": "config_routes-unavailable"}
 
     try:
         res = _request("GET", "/api/v1/contacts")
     except Exception as e:
-        print("[hub_sync] pull failed (state.yaml untouched):", e)
+        print("[hub_sync] pull failed (config.yaml untouched):", e)
         return {"ok": False, "reason": "unreachable"}
 
     if not res or not res.get("ok"):
         return {"ok": False, "reason": "bad-response"}
 
     contacts = res.get("contacts", [])
-    state = _load_yaml(path)
+    n_reply = n_nomention = n_paused = n_profile = 0
+    extra_admins = []
 
-    # Rebuild managed list sections from the merged map.
-    new_whitelist, new_nomention, new_admins = [], [], []
-    new_paused = {}
     for c in contacts:
         jid = c.get("jid")
         if not jid:
             continue
-        if c.get("whitelisted"):
-            new_whitelist.append(jid)
-        if c.get("noMention"):
-            new_nomention.append(jid)
+        is_group = str(jid).endswith("@g.us")
+        try:
+            fields = {}
+            fields["reply"] = bool(c.get("whitelisted"))
+            fields["no_mention"] = bool(c.get("noMention"))
+            fields["paused"] = bool(c.get("paused"))
+            fields["pause_reason"] = (c.get("pauseReason") or "") if c.get("paused") else ""
+            # Hub can move a chat's profile (only if it sent one).
+            prof = c.get("profile")
+            if prof:
+                fields["profile"] = str(prof)
+                n_profile += 1
+            # Only create a route entry if the hub actually flags something for it
+            # (avoid materializing a route for every contact the hub knows).
+            meaningful = (fields["reply"] or fields["no_mention"] or fields["paused"]
+                          or "profile" in fields)
+            cr.set_route_fields(jid, create_if_missing=meaningful, **fields)
+            if fields["reply"]:
+                n_reply += 1
+            if fields["no_mention"]:
+                n_nomention += 1
+            if fields["paused"]:
+                n_paused += 1
+        except Exception as e:
+            print(f"[hub_sync] pull: failed to apply contact {jid} (ignored): {e}")
+        # Admin flag → whatsapp_admins.extra (root is managed separately, never here).
         if c.get("isAdmin"):
-            new_admins.append(jid)
-        if c.get("paused"):
-            new_paused[jid] = c.get("pauseReason") or "paused"
+            extra_admins.append(jid)
 
-    state["reply_whitelist"] = sorted(new_whitelist)
-    state["no_mention_groups"] = sorted(new_nomention)
-    state["admins"] = sorted(new_admins)
-    state["paused_chats"] = new_paused
-    # root_admin + anything else in `state` is left exactly as-is.
+    # Reconcile the admin extra list (root left untouched).
+    try:
+        # Don't demote the root admin into extra; exclude it if present.
+        root = (cr.load_admins() or {}).get("root") or ""
+        extra_admins = sorted({j for j in extra_admins if j and j != root})
+        cr.set_admins(extra=extra_admins)
+    except Exception as e:
+        print(f"[hub_sync] pull: failed to apply admins (ignored): {e}")
 
-    _dump_yaml(path, state)
     return {
         "ok": True,
-        "whitelist": len(new_whitelist),
-        "no_mention": len(new_nomention),
-        "admins": len(new_admins),
-        "paused": len(new_paused),
+        "reply": n_reply,
+        "no_mention": n_nomention,
+        "paused": n_paused,
+        "profile_moves": n_profile,
+        "admins": len(extra_admins),
     }
 
 
 def push_full_state(state_file=None, source="plugin"):
-    """Reconcile: push the client's ENTIRE current state.yaml up as deltas so the
-    hub catches anything a dropped fire-and-forget POST missed. Safe because the
-    hub merges last-write-wins; called occasionally by the cron, not on the hot path."""
-    path = state_file or STATE_FILE
-    if not _enabled or not path:
+    """Reconcile: push the client's ENTIRE current per-chat config (from
+    config.yaml routes + whatsapp_admins) up as deltas so the hub catches anything
+    a dropped fire-and-forget POST missed. Last-write-wins on the hub side; called
+    occasionally by the cron, not on the hot path. `state_file` ignored."""
+    if not _enabled:
         return
-    state = _load_yaml(path)
+    cr = _config_routes()
+    if cr is None:
+        return
     now = int(time.time())
-    # Collect a union of all managed jids with their flags.
     by_jid = {}
-    for section in LIST_SECTIONS:
-        flag = SECTION_FLAG[section]
-        for j in (state.get(section) or []):
-            by_jid.setdefault(j, {"jid": j, "updatedAt": now})[flag] = True
-    for j, reason in (state.get("paused_chats") or {}).items():
-        e = by_jid.setdefault(j, {"jid": j, "updatedAt": now})
-        e["paused"] = True
-        e["pauseReason"] = reason
+    try:
+        for r in cr.load_routes():
+            jid = r.get("chat_id")
+            if not jid:
+                continue
+            e = by_jid.setdefault(jid, {"jid": jid, "updatedAt": now})
+            if r.get("reply") is True:
+                e["whitelisted"] = True
+            if r.get("no_mention") is True:
+                e["noMention"] = True
+            if r.get("paused") is True:
+                e["paused"] = True
+                e["pauseReason"] = r.get("pause_reason") or "paused"
+        for jid in (cr.load_admins() or {}).get("extra") or []:
+            by_jid.setdefault(jid, {"jid": jid, "updatedAt": now})["isAdmin"] = True
+    except Exception as e:
+        print(f"[hub_sync] push_full_state read failed (ignored): {e}")
+        return
     if by_jid:
         push_deltas(list(by_jid.values()), source=source, resolve_names=False)
 

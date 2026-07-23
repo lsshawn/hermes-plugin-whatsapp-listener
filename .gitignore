@@ -2,6 +2,8 @@
 # Kept out of git so `hermes plugins update` (git pull) never conflicts with a
 # client's live whitelist/admins/paused config.
 state.yaml
+# Per-box backup left by the DRY migration (contains the operator's admin jid).
+state.yaml.migrated.bak
 
 # Session backups the relink flow creates.
 *.bak.*
@@ -17,3 +19,6 @@ admins.txt
 admin_groups.txt
 paused_chats.json
 _migrated_backup/
+
+# Internal design/status notes (may reference this box's admin jid).
+DESIGN-dry-config.md

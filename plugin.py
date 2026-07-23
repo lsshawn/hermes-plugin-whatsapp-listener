@@ -7,6 +7,17 @@ import threading
 
 PLUGIN_DIR = os.path.dirname(__file__)
 
+
+def _hermes_home() -> str:
+    """Hermes home dir. Honors $HERMES_HOME (the gateway sets it) and falls back
+    to ~/.hermes. Used for config.yaml reads so the plugin and config_routes.py
+    agree on the same file (and so tests can point at a temp home)."""
+    return os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes")
+
+
+def _config_path() -> str:
+    return os.path.join(_hermes_home(), "config.yaml")
+
 # ---------------------------------------------------------------------------
 # Consolidated runtime state (single file, hot-editable).
 # Replaces the old whitelist.txt / admins.txt / admin_groups.txt / paused_chats.json.
@@ -73,14 +84,80 @@ except Exception as _e:
 # instead of the routed profile — the root cause of cross-profile data leaks.
 # These helpers let the listener resolve the routed profile the SAME way the
 # gateway does, so its session key + DB write match the gateway's.
-_LISTENER_ROUTES_CACHE = {"key": None, "map": {}}
+_LISTENER_ROUTES_CACHE = {"key": None, "map": {}, "routes": {}, "admins": None}
+
+
+def _refresh_routes_cache() -> None:
+    """Reparse config.yaml (WhatsApp routes + whatsapp_admins) into the cache when
+    config.yaml mtime changed. Populates:
+      - map: chat_id -> profile (str)
+      - routes: chat_id -> full route dict (reply/no_mention/paused/pause_reason/...)
+      - admins: {'root': str, 'extra': [str]}
+    This is the DRY replacement for the old state.yaml reads — one config.yaml,
+    re-read live per message (mtime-gated so it's cheap)."""
+    cfg_path = _config_path()
+    try:
+        mtime = os.stat(cfg_path).st_mtime_ns
+    except OSError:
+        return
+    if _LISTENER_ROUTES_CACHE["key"] == mtime:
+        return
+    m, routes = {}, {}
+    admins = {"root": "", "extra": []}
+    try:
+        import yaml
+        cfg = yaml.safe_load(open(cfg_path)) or {}
+        gw = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
+        for r in (gw.get("profile_routes") or []):
+            if not isinstance(r, dict):
+                continue
+            plat = (r.get("platform") or "").lower()
+            if plat and plat not in ("whatsapp", "whatsapp_cloud"):
+                continue
+            cid = r.get("chat_id")
+            if not cid:
+                continue
+            cid = str(cid)
+            routes[cid] = dict(r)
+            prof = r.get("profile")
+            if prof:
+                m[cid] = str(prof)
+        wa = cfg.get("whatsapp_admins")
+        if isinstance(wa, dict):
+            admins = {
+                "root": str(wa.get("root") or "").strip(),
+                "extra": [str(x).strip() for x in (wa.get("extra") or []) if str(x).strip()],
+            }
+    except Exception:
+        m, routes = {}, {}
+        admins = {"root": "", "extra": []}
+    _LISTENER_ROUTES_CACHE["key"] = mtime
+    _LISTENER_ROUTES_CACHE["map"] = m
+    _LISTENER_ROUTES_CACHE["routes"] = routes
+    _LISTENER_ROUTES_CACHE["admins"] = admins
+
+
+def _route_for_chat(chat_id: str) -> dict:
+    """Full route entry dict for a chat_id (reply/no_mention/paused/pause_reason/
+    profile/...), or {} if unrouted. Cached on config.yaml mtime. This is the DRY
+    single-source lookup that replaces state.yaml's reply_whitelist /
+    no_mention_groups / paused_chats sections."""
+    if not chat_id:
+        return {}
+    _refresh_routes_cache()
+    return _LISTENER_ROUTES_CACHE.get("routes", {}).get(str(chat_id), {})
+
+
+def _wa_admins() -> dict:
+    """{'root': str, 'extra': [str]} from config.yaml whatsapp_admins (mtime-cached)."""
+    _refresh_routes_cache()
+    return _LISTENER_ROUTES_CACHE.get("admins") or {"root": "", "extra": []}
 
 
 def _multiplex_on() -> bool:
     try:
         import yaml
-        cfg = yaml.safe_load(open(os.path.join(
-            os.path.expanduser("~/.hermes"), "config.yaml"))) or {}
+        cfg = yaml.safe_load(open(_config_path())) or {}
         gw = cfg.get("gateway")
         return bool(isinstance(gw, dict) and gw.get("multiplex_profiles"))
     except Exception:
@@ -97,25 +174,7 @@ def _profile_for_chat(chat_id: str) -> str:
         mtime = os.stat(cfg_path).st_mtime_ns
     except OSError:
         return "default"
-    if _LISTENER_ROUTES_CACHE["key"] != mtime:
-        m = {}
-        try:
-            import yaml
-            cfg = yaml.safe_load(open(cfg_path)) or {}
-            gw = cfg.get("gateway") if isinstance(cfg.get("gateway"), dict) else {}
-            for r in (gw.get("profile_routes") or []):
-                if not isinstance(r, dict):
-                    continue
-                plat = (r.get("platform") or "").lower()
-                if plat and plat not in ("whatsapp", "whatsapp_cloud"):
-                    continue
-                cid, prof = r.get("chat_id"), r.get("profile")
-                if cid and prof:
-                    m[str(cid)] = str(prof)
-        except Exception:
-            m = {}
-        _LISTENER_ROUTES_CACHE["key"] = mtime
-        _LISTENER_ROUTES_CACHE["map"] = m
+    _refresh_routes_cache()
     return _LISTENER_ROUTES_CACHE["map"].get(chat_id, "default")
 
 
@@ -126,6 +185,50 @@ def _profile_key_kwarg(chat_id: str) -> dict:
         return {}
     prof = _profile_for_chat(chat_id)
     return {"profile": prof} if prof and prof != "default" else {}
+
+
+# Profiles that are safe to run in a GROUP chat: only those confined by
+# config.yaml `profile_fs_allowlist` (their file access is boxed to their own
+# dirs, e.g. cgpt, yltc). An UNRESTRICTED profile (personal, apps-coder, ideas,
+# or any future profile with full file/terminal/session_search) must NEVER serve
+# a group — a second human in the group could otherwise pull the operator's
+# private data out of it. Such profiles are allowed only in DMs (1:1). Cached on
+# config.yaml mtime.
+_GROUPSAFE_CACHE = {"key": None, "set": set()}
+
+
+def _group_safe_profiles() -> set:
+    """Set of profile names allowed to run in a GROUP: the keys of
+    config.yaml `profile_fs_allowlist` (fs-confined profiles)."""
+    cfg_path = os.path.join(os.path.expanduser("~/.hermes"), "config.yaml")
+    try:
+        mtime = os.stat(cfg_path).st_mtime_ns
+    except OSError:
+        return set()
+    if _GROUPSAFE_CACHE["key"] != mtime:
+        s = set()
+        try:
+            import yaml
+            cfg = yaml.safe_load(open(cfg_path)) or {}
+            allow = cfg.get("profile_fs_allowlist")
+            if isinstance(allow, dict):
+                s = {str(k).strip().lower() for k in allow.keys()}
+        except Exception:
+            s = set()
+        _GROUPSAFE_CACHE["key"] = mtime
+        _GROUPSAFE_CACHE["set"] = s
+    return _GROUPSAFE_CACHE["set"]
+
+
+def _profile_allowed_in_group(profile: str) -> bool:
+    """True if `profile` may serve a GROUP chat. Unrestricted profiles are
+    DM-only. 'default' is treated as group-safe here because its WhatsApp surface
+    is separately locked (platform_toolsets: messaging-only) — but a group with no
+    route shouldn't reach the reply path anyway."""
+    p = (profile or "default").strip().lower()
+    if p == "default":
+        return True
+    return p in _group_safe_profiles()
 
 
 def _scoped_session_db(chat_id: str):
@@ -140,6 +243,103 @@ def _scoped_session_db(chat_id: str):
             if pdir.is_dir():
                 return SessionDB(db_path=pdir / "state.db")
     return SessionDB()
+
+
+def _build_silent_content(event, text: str) -> str:
+    """Build the message content to store on the SILENT path, capturing text +
+    voice (transcribed) + attachments — so the agent has real context of chats it
+    doesn't reply in.
+
+    Reuses CORE helpers so the stored format matches the reply path exactly:
+      - voice: transcribe_audio() (core's Groq/STT-backed sync transcriber) — the
+        transcript is stored as a quoted line, same as _enrich_message_with_
+        transcription does on the reply path.
+      - other attachments (image/video/doc/file): _build_media_placeholder(event)
+        yields "[User sent an image: <url>]" etc. (core format; media itself is
+        already cached by the WhatsApp bridge).
+
+    FAIL-SOFT: any import/STT/media error falls back to the plain text we have.
+    Never raises — the caller must always be able to store SOMETHING and skip.
+    These core symbols are private-ish; wrapping them keeps a future hermes
+    update rename from breaking silent-save (see DESIGN-dry-config.md)."""
+    base = (text or "").strip()
+    try:
+        media_urls = getattr(event, "media_urls", None) or []
+    except Exception:
+        media_urls = []
+    if not media_urls:
+        return base
+
+    parts = []
+    try:
+        from gateway.run import (
+            _event_media_is_stt_input,
+            _event_media_is_image,
+            _event_media_is_audio,
+            _event_media_is_video,
+        )
+    except Exception:
+        _event_media_is_stt_input = _event_media_is_image = None
+        _event_media_is_audio = _event_media_is_video = None
+
+    # 1) Voice/audio → transcribe inline (Groq STT via core's sync transcriber).
+    transcribed_any = False
+    if _event_media_is_stt_input is not None:
+        try:
+            from tools.transcription_tools import transcribe_audio
+        except Exception:
+            transcribe_audio = None
+        for i, path in enumerate(media_urls):
+            try:
+                if not _event_media_is_stt_input(event, i):
+                    continue
+                if transcribe_audio is None:
+                    parts.append("[User sent a voice message]")
+                    continue
+                result = transcribe_audio(path)
+                if isinstance(result, dict) and result.get("success") and result.get("transcript"):
+                    parts.append(f'🎙️ "{result["transcript"].strip()}"')
+                    transcribed_any = True
+                else:
+                    parts.append("[voice message could not be transcribed]")
+            except Exception:
+                parts.append("[voice message could not be transcribed]")
+
+    # 2) Non-STT attachments → core placeholder ([User sent an image: <url>] etc.)
+    #    Skip indices we already handled as voice to avoid double-counting.
+    try:
+        from gateway.run import _build_media_placeholder
+        # _build_media_placeholder covers ALL media_urls; only use it when there's
+        # a non-audio attachment, else we'd duplicate the voice line.
+        has_non_audio = False
+        for i in range(len(media_urls)):
+            try:
+                is_audio = _event_media_is_audio(event, i) if _event_media_is_audio else False
+                is_stt = _event_media_is_stt_input(event, i) if _event_media_is_stt_input else False
+                if not (is_audio or is_stt):
+                    has_non_audio = True
+                    break
+            except Exception:
+                has_non_audio = True
+                break
+        if has_non_audio:
+            ph = _build_media_placeholder(event)
+            if ph:
+                # If we transcribed voice, only append placeholders for the
+                # non-audio lines to avoid restating the audio url.
+                if transcribed_any or parts:
+                    for line in ph.splitlines():
+                        if "audio" not in line.lower():
+                            parts.append(line)
+                else:
+                    parts.append(ph)
+    except Exception:
+        pass
+
+    all_parts = [p for p in parts if p]
+    if base:
+        all_parts.append(base)
+    return "\n".join(all_parts) if all_parts else base
 
 
 def _hub_flag_for(section):
@@ -253,32 +453,34 @@ def _load_state() -> dict:
     return {}
 
 
-def _save_state(state: dict) -> None:
-    """Persist the consolidated state.yaml, preserving the header comments."""
+# NOTE: _save_state() was removed with the DRY migration — the plugin no longer
+# WRITES state.yaml. All writes go to config.yaml via config_routes.py. _load_state()
+# is kept only as a read-only LEGACY fallback in _root_admin() for boxes not yet
+# migrated (state.yaml still present); it no-ops once state.yaml is gone.
+
+
+# Root admin now lives in config.yaml `whatsapp_admins.root` (read live, mtime-
+# cached). Falls back to the legacy state.yaml root_admin (during/after migration)
+# and finally the historical placeholder so an empty config never locks the
+# operator out.
+def _root_admin() -> str:
+    root = (_wa_admins().get("root") or "").strip()
+    if root:
+        return root
+    # legacy fallback: state.yaml (only present pre-migration)
     try:
-        header = (
-            "# whatsapp-listener consolidated state (hot-editable at runtime)\n"
-            "# root_admin: permanent admin, never removable\n"
-            "# admins: extra admins (/admin add|remove)\n"
-            "# reply_whitelist: chats the bot REPLIES in (/whitelist add|remove); others are still stored silently\n"
-            "# admin_groups: groups where ops/slash commands are allowed\n"
-            "# no_mention_groups: whitelisted groups EXEMPT from the mention requirement (/no-mention add|remove)\n"
-            "#   Default: whitelisted GROUPS require a direct @mention; listed groups reply without one.\n"
-            "#   NOTE: keep core config.yaml `require_mention: false`. If core has require_mention: true,\n"
-            "#   core drops non-mention group messages upstream before this plugin runs, so the plugin can\n"
-            "#   neither reply nor silently store them and this list can never fire.\n"
-            "# paused_chats: chat_id -> reason (managed by pause/resume + handoff)\n"
-        )
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            f.write(header)
-            yaml.safe_dump(state, f, sort_keys=False, allow_unicode=True, default_flow_style=False)
-    except Exception as e:
-        print(f"[whatsapp-listener] Failed to write state.yaml: {e}")
+        legacy = str(_load_state().get("root_admin") or "").strip()
+        if legacy:
+            return legacy
+    except Exception:
+        pass
+    return "YOUR_NUMBER@s.whatsapp.net"
 
 
-# Root admin now lives in state.yaml (falls back to the historical default so
-# an empty/missing file never locks the operator out).
-ROOT_ADMIN_ID = str(_load_state().get("root_admin") or "YOUR_NUMBER@s.whatsapp.net")
+# Back-compat shim: some call sites still read ROOT_ADMIN_ID as a value. It's now
+# resolved live via _root_admin(); this module-level snapshot is only a fallback
+# default and should not be relied on for the current root (use _root_admin()).
+ROOT_ADMIN_ID = _root_admin()
 
 # Detect the gateway/bot identity (the number used by this WhatsApp gateway)
 # so we can match user mentions like "@<bot-number>".
@@ -415,51 +617,51 @@ def _event_indicates_bot_mention(event, *, bot_numeric: str, bot_name: str, bot_
     except Exception:
         return False
 
+# ---------------------------------------------------------------------------
+# DRY reads: derive whitelist / no_mention / admins from config.yaml routes.
+# state.yaml is retired — these read the SAME single source (config.yaml
+# gateway.profile_routes + whatsapp_admins), live via the mtime-cached
+# _refresh_routes_cache(). Function names/signatures are preserved so existing
+# call sites are unchanged.
+# ---------------------------------------------------------------------------
 def load_set_from_file(section):
-    """Read a list-valued section of state.yaml as a set.
+    """Return a set of chat_ids/jids for a logical section, derived from
+    config.yaml. `section` is one of WHITELIST_FILE / NO_MENTION_FILE /
+    ADMINS_FILE / ADMIN_GROUPS_FILE (names kept for call-site compatibility).
 
-    `section` is one of the WHITELIST_FILE / ADMINS_FILE / ADMIN_GROUPS_FILE
-    logical names (kept for call-site compatibility with the old .txt files).
+    - reply_whitelist  -> chat_ids whose route has reply: true
+    - no_mention_groups -> chat_ids whose route has no_mention: true
+    - admins           -> whatsapp_admins.extra (root added by get_all_admins)
+    - admin_groups     -> DROPPED (decision 2): always empty set.
     """
-    with _STATE_LOCK:
-        state = _load_state()
-    items = state.get(section) or []
-    if not isinstance(items, list):
-        return set()
-    return {str(x).strip() for x in items if str(x).strip()}
-
-def save_set_to_file(section, data_set):
-    """Write a set back into a list-valued section of state.yaml (atomic-ish)."""
-    new_set = {str(x).strip() for x in data_set if str(x).strip()}
-    with _STATE_LOCK:
-        state = _load_state()
-        old_set = {str(x).strip() for x in (state.get(section) or []) if str(x).strip()}
-        state[section] = sorted(new_set)
-        _save_state(state)
-    # Mirror the change to the hub AFTER the local write succeeds (best-effort).
-    _hub_push_section_diff(section, old_set, new_set)
+    _refresh_routes_cache()
+    routes = _LISTENER_ROUTES_CACHE.get("routes", {})
+    if section == WHITELIST_FILE:
+        return {cid for cid, r in routes.items() if r.get("reply") is True}
+    if section == NO_MENTION_FILE:
+        return {cid for cid, r in routes.items() if r.get("no_mention") is True}
+    if section == ADMINS_FILE:
+        return set(_wa_admins().get("extra") or [])
+    # ADMIN_GROUPS_FILE and anything else: dropped / unused.
+    return set()
 
 def get_all_admins():
-    admins = load_set_from_file(ADMINS_FILE)
-    # Always include the root admin
-    if ROOT_ADMIN_ID and ROOT_ADMIN_ID != "YOUR_NUMBER@s.whatsapp.net":
-        admins.add(ROOT_ADMIN_ID)
+    admins = set(_wa_admins().get("extra") or [])
+    root = _root_admin()
+    if root and root != "YOUR_NUMBER@s.whatsapp.net":
+        admins.add(root)
     return admins
 
 def load_paused_chats() -> dict:
-    with _STATE_LOCK:
-        state = _load_state()
-    pc = state.get("paused_chats") or {}
-    return pc if isinstance(pc, dict) else {}
-
-def save_paused_chats(paused_chats: dict):
-    with _STATE_LOCK:
-        state = _load_state()
-        old_map = dict(state.get("paused_chats") or {})
-        state["paused_chats"] = paused_chats
-        _save_state(state)
-    # Mirror pause/resume to the hub AFTER the local write succeeds (best-effort).
-    _hub_push_paused_diff(old_map, dict(paused_chats or {}))
+    """chat_id -> pause_reason for chats MANUALLY paused (route.paused: true).
+    Automated handoff-pause is separate (is_chat_in_handoff / concierge.db)."""
+    _refresh_routes_cache()
+    routes = _LISTENER_ROUTES_CACHE.get("routes", {})
+    out = {}
+    for cid, r in routes.items():
+        if r.get("paused") is True:
+            out[cid] = r.get("pause_reason") or "paused"
+    return out
 
 def is_chat_in_handoff(chat_id: str) -> tuple:
     """Check if the chat has any open order in a handoff state.
@@ -924,10 +1126,14 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                             if not target_chat_id:
                                 send_msg(f"⚠️ *Client '{biz_name}' has no mapped WhatsApp Chat ID.*")
                             else:
-                                paused_chats = load_paused_chats()
-                                paused_chats[target_chat_id] = biz_name
-                                save_paused_chats(paused_chats)
-                                send_msg(f"⏸️ *AI Auto-Reply Paused* for *{biz_name}*.")
+                                old = load_paused_chats()
+                                try:
+                                    from . import config_routes as _cr
+                                    _cr.set_route_fields(target_chat_id, paused=True, pause_reason=biz_name)
+                                    _hub_push_paused_diff(old, {**old, target_chat_id: biz_name})
+                                    send_msg(f"⏸️ *AI Auto-Reply Paused* for *{biz_name}*.")
+                                except Exception as we:
+                                    send_msg(f"⚠️ Couldn't update config.yaml: {we}")
                 except Exception as e:
                     send_msg(f"❌ *Error pausing client:* {e}")
                 return {"action": "skip", "reason": "Intercepted admin group pause command"}
@@ -969,11 +1175,16 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                             if not target_chat_id:
                                 send_msg(f"⚠️ *Client '{biz_name}' has no mapped WhatsApp Chat ID.*")
                             else:
-                                paused_chats = load_paused_chats()
-                                if target_chat_id in paused_chats:
-                                    del paused_chats[target_chat_id]
-                                    save_paused_chats(paused_chats)
-                                    send_msg(f"▶️ *AI Auto-Reply Resumed* for *{biz_name}*.")
+                                old = load_paused_chats()
+                                if target_chat_id in old:
+                                    try:
+                                        from . import config_routes as _cr
+                                        _cr.set_route_fields(target_chat_id, paused=False, pause_reason="")
+                                        new_map = {k: v for k, v in old.items() if k != target_chat_id}
+                                        _hub_push_paused_diff(old, new_map)
+                                        send_msg(f"▶️ *AI Auto-Reply Resumed* for *{biz_name}*.")
+                                    except Exception as we:
+                                        send_msg(f"⚠️ Couldn't update config.yaml: {we}")
                                 else:
                                     send_msg(f"ℹ️ *Client '{biz_name}' is not currently manually paused.*")
                 except Exception as e:
@@ -1171,46 +1382,57 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
 
         # ---------------------------------------------------------
         # COMMAND: /whitelist add|remove <id>
+        # Now writes config.yaml gateway.profile_routes[chat].reply (DRY: single
+        # source). Adding a chat with no route entry creates one (profile 'default'
+        # until routed). Effective LIVE on the next message (mtime-cached reread).
         # ---------------------------------------------------------
         if text.lower().startswith("/whitelist"):
-            
             parts = text.split()
-            wl = load_set_from_file(WHITELIST_FILE)
-            
+
+            def _set_reply(cid, val):
+                try:
+                    from . import config_routes as _cr
+                    _cr.set_route_fields(cid, reply=val)
+                    # Mirror to hub AFTER the local write (best-effort).
+                    if val:
+                        _hub_push_section_diff(WHITELIST_FILE, set(), {cid})
+                    else:
+                        _hub_push_section_diff(WHITELIST_FILE, {cid}, set())
+                    return True
+                except Exception as e:
+                    print(f"[whatsapp-listener] /whitelist config write failed: {e}")
+                    send_msg(f"⚠️ Couldn't update config.yaml: {e}")
+                    return False
+
             if len(parts) >= 3:
                 action = parts[1].lower()
                 target_id = parts[2]
-                
                 if action == "add":
-                    wl.add(target_id)
-                    save_set_to_file(WHITELIST_FILE, wl)
-                    send_msg(f"✅ Added to whitelist:\n{target_id}")
+                    if _set_reply(target_id, True):
+                        send_msg(f"✅ Added to whitelist:\n{target_id}")
                 elif action == "remove":
-                    wl.discard(target_id)
-                    save_set_to_file(WHITELIST_FILE, wl)
-                    send_msg(f"❌ Removed from whitelist:\n{target_id}")
+                    if _set_reply(target_id, False):
+                        send_msg(f"❌ Removed from whitelist:\n{target_id}")
                 else:
                     send_msg("Usage: /whitelist add <id> OR /whitelist remove <id>")
             elif len(parts) == 2:
                 action = parts[1].lower()
                 if action == "remove" and "g.us" in chat_id:
-                    wl.discard(chat_id)
-                    save_set_to_file(WHITELIST_FILE, wl)
-                    send_msg(f"❌ Removed from whitelist:\n{chat_id}")
+                    if _set_reply(chat_id, False):
+                        send_msg(f"❌ Removed from whitelist:\n{chat_id}")
                 else:
                     send_msg("Usage: /whitelist add <id> OR /whitelist remove <id>")
             else:
                 # Bare /whitelist in a group: auto-add this group
                 if "g.us" in chat_id:
-                    if chat_id in wl:
+                    if _route_for_chat(chat_id).get("reply") is True:
                         send_msg(f"ℹ️ Already whitelisted:\n{chat_id}")
-                    else:
-                        wl.add(chat_id)
-                        save_set_to_file(WHITELIST_FILE, wl)
+                    elif _set_reply(chat_id, True):
                         send_msg(f"✅ Whitelisted this group:\n{chat_id}")
                 else:
-                    send_msg(f"Usage: /whitelist add <id> OR /whitelist remove <id>\nCurrent whitelisted chats: {len(wl)}")
-                
+                    n = len(load_set_from_file(WHITELIST_FILE))
+                    send_msg(f"Usage: /whitelist add <id> OR /whitelist remove <id>\nCurrent whitelisted chats: {n}")
+
             return {"action": "skip", "reason": "Intercepted /whitelist command"}
 
         # ---------------------------------------------------------
@@ -1219,6 +1441,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
         # replies (safe default). Groups added here are EXEMPT — the bot replies
         # to every message without a mention. Requires core require_mention:
         # false (otherwise core drops non-mention messages upstream).
+        # Now writes config.yaml route.no_mention (DRY).
         # ---------------------------------------------------------
         if text.lower().startswith("/no-mention"):
             if not is_admin:
@@ -1226,63 +1449,82 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 return {"action": "skip", "reason": "Unauthorized /no-mention attempt"}
 
             parts = text.split()
-            nm = load_set_from_file(NO_MENTION_FILE)
+
+            def _set_no_mention(cid, val):
+                try:
+                    from . import config_routes as _cr
+                    _cr.set_route_fields(cid, no_mention=val)
+                    _hub_push_section_diff(NO_MENTION_FILE,
+                                           set() if val else {cid},
+                                           {cid} if val else set())
+                    return True
+                except Exception as e:
+                    print(f"[whatsapp-listener] /no-mention config write failed: {e}")
+                    send_msg(f"⚠️ Couldn't update config.yaml: {e}")
+                    return False
 
             if len(parts) >= 3:
                 action = parts[1].lower()
                 target_id = parts[2]
-
                 if action == "add":
-                    nm.add(target_id)
-                    save_set_to_file(NO_MENTION_FILE, nm)
-                    send_msg(f"✅ No-mention mode ON for:\n{target_id}\n\n"
-                             "(Group must also be in the reply whitelist. Bot now "
-                             "replies to every message here, no @mention needed.)")
+                    if _set_no_mention(target_id, True):
+                        send_msg(f"✅ No-mention mode ON for:\n{target_id}\n\n"
+                                 "(Group must also be whitelisted / reply: true. Bot now "
+                                 "replies to every message here, no @mention needed.)")
                 elif action == "remove":
-                    nm.discard(target_id)
-                    save_set_to_file(NO_MENTION_FILE, nm)
-                    send_msg(f"❌ No-mention mode OFF for:\n{target_id}\n\n"
-                             "(Back to the default: bot only replies here when directly @mentioned.)")
+                    if _set_no_mention(target_id, False):
+                        send_msg(f"❌ No-mention mode OFF for:\n{target_id}\n\n"
+                                 "(Back to the default: bot only replies here when directly @mentioned.)")
                 else:
                     send_msg("Usage: /no-mention add <id> OR /no-mention remove <id>")
             else:
+                n = len(load_set_from_file(NO_MENTION_FILE))
                 send_msg(f"Usage: /no-mention add <id> OR /no-mention remove <id>\n"
-                         f"Current no-mention groups: {len(nm)}")
+                         f"Current no-mention groups: {n}")
 
             return {"action": "skip", "reason": "Intercepted /no-mention command"}
 
         # ---------------------------------------------------------
         # COMMAND: /admin add|remove <id>
+        # Now writes config.yaml whatsapp_admins.extra (DRY). Root admin
+        # (whatsapp_admins.root) is never removable.
         # ---------------------------------------------------------
         if text.lower().startswith("/admin"):
             if not is_admin:
                 send_msg("🚫 Unauthorized. Only admins can use this command.")
                 return {"action": "skip", "reason": "Unauthorized /admin attempt"}
-            
+
             parts = text.split()
-            admins = load_set_from_file(ADMINS_FILE)
-            
+
             if len(parts) >= 3:
                 action = parts[1].lower()
                 target_id = parts[2]
-                
+                extra = set(_wa_admins().get("extra") or [])
                 if action == "add":
-                    admins.add(target_id)
-                    save_set_to_file(ADMINS_FILE, admins)
-                    send_msg(f"✅ Added new admin:\n{target_id}")
+                    extra.add(target_id)
+                    try:
+                        from . import config_routes as _cr
+                        _cr.set_admins(extra=sorted(extra))
+                        send_msg(f"✅ Added new admin:\n{target_id}")
+                    except Exception as e:
+                        send_msg(f"⚠️ Couldn't update config.yaml: {e}")
                 elif action == "remove":
-                    if target_id == ROOT_ADMIN_ID:
+                    if target_id == _root_admin():
                         send_msg("❌ Cannot remove the Root Admin.")
                     else:
-                        admins.discard(target_id)
-                        save_set_to_file(ADMINS_FILE, admins)
-                        send_msg(f"❌ Removed admin:\n{target_id}")
+                        extra.discard(target_id)
+                        try:
+                            from . import config_routes as _cr
+                            _cr.set_admins(extra=sorted(extra))
+                            send_msg(f"❌ Removed admin:\n{target_id}")
+                        except Exception as e:
+                            send_msg(f"⚠️ Couldn't update config.yaml: {e}")
                 else:
                     send_msg("Usage: /admin add <id> OR /admin remove <id>")
             else:
                 all_admins = get_all_admins()
                 send_msg(f"Usage: /admin add <id> OR /admin remove <id>\nCurrent admins: {len(all_admins)}")
-                
+
             return {"action": "skip", "reason": "Intercepted /admin command"}
 
         # ---------------------------------------------------------
@@ -1511,13 +1753,29 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             # effect on the NEXT message with no restart. Only stamp for a real
             # routed profile under multiplex; leave unset otherwise so single-
             # profile / default behavior is byte-identical.
-            try:
-                _pk = _profile_key_kwarg(chat_id)  # {} unless multiplex + non-default route
-                if _pk and getattr(source, "profile", None) != _pk["profile"]:
-                    source.profile = _pk["profile"]
-            except Exception:
-                pass
-            return None
+            _resolved_profile = _profile_for_chat(chat_id) if _multiplex_on() else "default"
+
+            # GROUP SAFETY (hard rule): an UNRESTRICTED profile (personal,
+            # apps-coder, ideas, …) must never run in a GROUP — a second human in
+            # the group could pull the operator's private data out of its replies.
+            # Only fs-allowlisted profiles (cgpt, yltc) or default (separately
+            # locked) may serve groups; unrestricted profiles are DM-only. This
+            # holds even for an admin @mention. Fall through to silent-save.
+            if is_group and not _profile_allowed_in_group(_resolved_profile):
+                print(
+                    f"[whatsapp-listener] BLOCKED reply: profile '{_resolved_profile}' "
+                    f"is not group-safe (unrestricted); chat={chat_id}. "
+                    f"Unrestricted profiles are DM-only. Saving silently."
+                )
+                should_reply = False
+            else:
+                try:
+                    _pk = _profile_key_kwarg(chat_id)  # {} unless multiplex + non-default route
+                    if _pk and getattr(source, "profile", None) != _pk["profile"]:
+                        source.profile = _pk["profile"]
+                except Exception:
+                    pass
+                return None
 
         # Silently save to SQLite without triggering LLM
         # Use the global `build_session_key` function since `gateway` doesn't expose it safely
@@ -1555,11 +1813,22 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
         if not safe_source:
             return {"action": "skip", "reason": "Failed to create SessionSource"}
 
+        # FULL-CONTEXT silent capture (decision 5): store text + voice + attachments
+        # so the agent has real context of chats it doesn't reply in. Reuses CORE
+        # helpers (no new media schema): _build_media_placeholder for attachments,
+        # transcribe_audio for voice. Everything is fail-soft — on any error we
+        # fall back to whatever text we already have and still store a row.
+        content_to_store = _build_silent_content(event, text)
+
         # Use scoped DB (routed profile's state.db) for BOTH session creation
         # AND message appending. Previously session_store.get_or_create_session()
         # always hit the default profile's state.db, leaking default memory/history
         # (IBKR, agenda, etc.) into routed cgpt/yltc chats.
         db = _scoped_session_db(chat_id)
+        # Routed profile for this chat (live). Stored on the session so its rows are
+        # correctly tagged. NOTE: create_session persists `profile_name` (NOT the
+        # `profile` column) — verified against hermes_state._insert_session_row.
+        _routed_profile = _profile_for_chat(chat_id) if _multiplex_on() else "default"
         try:
             # Look up existing session by session_key in the scoped DB.
             source_str = f"whatsapp:{chat_id}"
@@ -1577,18 +1846,19 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 from datetime import datetime
                 now = datetime.utcnow()
                 session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-                db.create_session(
-                    session_id,
-                    source_str,
+                _create_kwargs = dict(
                     session_key=session_key,
                     chat_id=chat_id,
                     chat_type="group" if is_group else "dm",
                     user_id=user_id,
                 )
+                if _routed_profile and _routed_profile != "default":
+                    _create_kwargs["profile_name"] = _routed_profile
+                db.create_session(session_id, source_str, **_create_kwargs)
             db.append_message(
                 session_id=session_id,
                 role="user",
-                content=text
+                content=content_to_store,
             )
         except Exception as err:
             pass

@@ -43,11 +43,20 @@ hermes plugins install lsshawn/-hermes-plugin-whatsapp-listener
 hermes plugins enable whatsapp-listener
 ```
 
-Set your admin number in the plugin's `state.yaml`:
+Set your admin number in `~/.hermes/config.yaml` (state.yaml is retired — all
+per-chat config now lives in config.yaml as the single source of truth):
 
 ```yaml
-root_admin: 60123456789@s.whatsapp.net
+whatsapp_admins:
+  root: 60123456789@s.whatsapp.net   # permanent admin, never removable
+  extra: []                          # managed by /admin add|remove
 ```
+
+Per-chat behaviour (reply / no_mention / paused) lives as fields on each chat's
+entry under `gateway.profile_routes`, and is managed at runtime via the in-chat
+commands below (and by cupbots-hub). See `state.yaml.example` for the full schema.
+Changes take effect **live** — no gateway restart, including moving a chat's
+profile.
 
 Restart the gateway:
 
@@ -69,14 +78,19 @@ hermes plugins update whatsapp-listener
 | file | purpose |
 |---|---|
 | `plugin.py` | core: silent-listener, whitelist/pause/no-mention, in-chat commands |
+| `config_routes.py` | comment-safe atomic read/write of config.yaml (routes + whatsapp_admins) — the one writer for in-chat commands AND the hub |
 | `__init__.py` | registers the `pre_gateway_dispatch` hook + starts the relink watcher |
 | `relink_watcher.py` | connection-status heartbeat + auto QR relink (hub) |
 | `hub_sync.py` | hub sync library — no-ops if the hub isn't configured |
+| `migrate_state_to_config.py` | one-time state.yaml → config.yaml migration (already run) |
 | `plugin.yaml` | plugin manifest |
 
 ## How it stays resilient
 
-Local `state.yaml` is always the source of truth and is written **before** any
-hub call. Every hub interaction is fire-and-forget and guarded — a hub or network
-outage can never block or break message handling. When the hub returns, queued
-changes reconcile by timestamp.
+`~/.hermes/config.yaml` is the single source of truth and is written **before** any
+hub call (atomically, comments preserved, via `config_routes.py`). Every hub
+interaction is fire-and-forget and guarded — a hub or network outage can never
+block or break message handling. When the hub returns, queued changes reconcile by
+timestamp. Per-chat config is re-read live on config.yaml mtime, so whitelist /
+pause / no_mention / profile changes take effect on the next message with no
+gateway restart.
