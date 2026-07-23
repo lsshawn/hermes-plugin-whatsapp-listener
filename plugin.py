@@ -1502,6 +1502,21 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
 
         # Let default Hermes handle it (sends to LLM)
         if should_reply:
+            # LIVE PROFILE ROUTING (no gateway restart): stamp source.profile from
+            # the mtime-live route map BEFORE handing off. The gateway's profile
+            # resolution checks source.profile FIRST (priority 1 in
+            # _resolve_profile_home_for_source), before its own BOOT-CACHED
+            # profile_routes (priority 2). By setting it here — where we reparse
+            # config.yaml on every message — a profile change in config.yaml takes
+            # effect on the NEXT message with no restart. Only stamp for a real
+            # routed profile under multiplex; leave unset otherwise so single-
+            # profile / default behavior is byte-identical.
+            try:
+                _pk = _profile_key_kwarg(chat_id)  # {} unless multiplex + non-default route
+                if _pk and getattr(source, "profile", None) != _pk["profile"]:
+                    source.profile = _pk["profile"]
+            except Exception:
+                pass
             return None
 
         # Silently save to SQLite without triggering LLM
