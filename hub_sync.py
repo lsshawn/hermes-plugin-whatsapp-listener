@@ -474,6 +474,12 @@ def push_full_state(state_file=None, source="plugin"):
             if r.get("paused") is True:
                 e["paused"] = True
                 e["pauseReason"] = r.get("pause_reason") or "paused"
+            # Report the chat's current profile so the hub can tag the contact
+            # (drives the sidebar profile filter + per-contact dropdown default).
+            # Skip 'default'/unset — a null profile on the hub means "unassigned".
+            prof = r.get("profile")
+            if prof and str(prof) != "default":
+                e["profile"] = str(prof)
         for jid in (cr.load_admins() or {}).get("extra") or []:
             by_jid.setdefault(jid, {"jid": jid, "updatedAt": now})["isAdmin"] = True
     except Exception as e:
