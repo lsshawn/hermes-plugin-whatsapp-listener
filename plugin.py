@@ -654,7 +654,7 @@ def get_all_admins():
 
 def load_paused_chats() -> dict:
     """chat_id -> pause_reason for chats MANUALLY paused (route.paused: true).
-    Automated handoff-pause is separate (is_chat_in_handoff / concierge.db)."""
+    Automated handoff-pause is separate (is_chat_in_handoff / app.db)."""
     _refresh_routes_cache()
     routes = _LISTENER_ROUTES_CACHE.get("routes", {})
     out = {}
@@ -670,7 +670,7 @@ def is_chat_in_handoff(chat_id: str) -> tuple:
     if not chat_id:
         return False, ""
     try:
-        db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+        db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
         if not os.path.exists(db_path):
             return False, ""
         
@@ -681,7 +681,7 @@ def is_chat_in_handoff(chat_id: str) -> tuple:
             
             # Find client for this chat
             client_row = conn.execute(
-                "SELECT id, business_name FROM clients WHERE whatsapp_chat_id = ? OR whatsapp_chat_id LIKE ?",
+                "SELECT id, display_name AS business_name FROM account WHERE whatsapp_chat_id = ? OR whatsapp_chat_id LIKE ?",
                 (chat_id, f"%{chat_norm}%")
             ).fetchone()
             
@@ -690,7 +690,7 @@ def is_chat_in_handoff(chat_id: str) -> tuple:
                 
                 # Check for an active handoff order
                 order_row = conn.execute(
-                    "SELECT id, status FROM orders WHERE client_id = ? AND (human_handoff = 1 OR status = 'handoff') "
+                    "SELECT id, status FROM [transaction] WHERE kind='order' AND account_id = ? AND (human_handoff = 1 OR status = 'handoff') "
                     "ORDER BY updated_at DESC LIMIT 1",
                     (client_id,)
                 ).fetchone()
@@ -698,7 +698,7 @@ def is_chat_in_handoff(chat_id: str) -> tuple:
                 if order_row:
                     # Let's find the audit note / reason
                     audit_row = conn.execute(
-                        "SELECT note FROM order_audit_logs WHERE order_id = ? AND action = 'handoff' "
+                        "SELECT note FROM event_log WHERE transaction_id = ? AND status = 'handoff' "
                         "ORDER BY id DESC LIMIT 1",
                         (order_row["id"],)
                     ).fetchone()
@@ -731,14 +731,14 @@ def _init_known_paused():
             _KNOWN_PAUSED_CHATS.add(cid)
             _KNOWN_PAUSED_CHATS.add(cid.split("@")[0])
         # 2. Database handoffs
-        db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+        db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
         if os.path.exists(db_path):
             import sqlite3
             with sqlite3.connect(db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    "SELECT whatsapp_chat_id FROM clients c "
-                    "JOIN orders o ON o.client_id = c.id "
+                    "SELECT whatsapp_chat_id FROM account c "
+                    "JOIN [transaction] o ON o.account_id = c.id AND o.kind='order' "
                     "WHERE o.human_handoff = 1 OR o.status = 'handoff'"
                 ).fetchall()
                 for r in rows:
@@ -1017,23 +1017,23 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             if resume_session_match:
                 client_query = resume_session_match.group(1).strip()
                 title_name = resume_session_match.group(2).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (client_query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{client_query}%",)
                             ).fetchall()
                         
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(f"❌ *No active client found* matching '{client_query}'.\n\n💡 *Available client names:*\n{client_names_str}")
                         elif len(clients_db) > 1:
@@ -1091,7 +1091,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             
             elif pause_match:
                 query = pause_match.group(1).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
@@ -1099,17 +1099,17 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                         
                         # Find client
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{query}%",)
                             ).fetchall()
                             
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(
                                 f"❌ *No active client found* matching '{query}'.\n\n"
@@ -1140,7 +1140,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 
             elif resume_match:
                 query = resume_match.group(1).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
@@ -1148,17 +1148,17 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                         
                         # Find client
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{query}%",)
                             ).fetchall()
                             
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(
                                 f"❌ *No active client found* matching '{query}'.\n\n"
@@ -1193,23 +1193,23 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             
             elif new_session_match:
                 query = new_session_match.group(1).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{query}%",)
                             ).fetchall()
                         
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(f"❌ *No active client found* matching '{query}'.\n\n💡 *Available client names:*\n{client_names_str}")
                         elif len(clients_db) > 1:
@@ -1258,23 +1258,23 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             elif title_match:
                 client_query = title_match.group(1).strip()
                 title_name = title_match.group(2).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (client_query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{client_query}%",)
                             ).fetchall()
                         
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(f"❌ *No active client found* matching '{client_query}'.\n\n💡 *Available client names:*\n{client_names_str}")
                         elif len(clients_db) > 1:
@@ -1307,7 +1307,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 return {"action": "skip", "reason": "Intercepted admin group title command"}
                 
             elif paused_match:
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     paused_chats = load_paused_chats()
                     manual_lines = []
@@ -1320,8 +1320,8 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
                         handoffs = db_conn.execute(
-                            "SELECT c.business_name, o.id, o.updated_at FROM orders o "
-                            "JOIN clients c ON o.client_id = c.id "
+                            "SELECT c.display_name AS business_name, o.id, o.updated_at FROM [transaction] o "
+                            "JOIN account c ON o.account_id = c.id "
                             "WHERE o.human_handoff = 1 OR o.status = 'handoff' "
                             "ORDER BY o.updated_at DESC"
                         ).fetchall()
@@ -1339,14 +1339,14 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 return {"action": "skip", "reason": "Intercepted admin group paused list command"}
                 
             elif sync_match:
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     import urllib.request
                     
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
-                        rows = db_conn.execute("SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1").fetchall()
+                        rows = db_conn.execute("SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1").fetchall()
                         
                         updates = []
                         for r in rows:
@@ -1371,7 +1371,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                             send_msg("🔄 *WhatsApp group sync complete.*\nAll database client names are already perfectly aligned with your active WhatsApp groups!")
                         else:
                             for new_name, cid, old_name in updates:
-                                db_conn.execute("UPDATE clients SET business_name=? WHERE id=?", (new_name, cid))
+                                db_conn.execute("UPDATE account SET display_name=? WHERE id=?", (new_name, cid))
                             db_conn.commit()
                             
                             updates_str = "\n".join([f"- *{old_name}* ➔ *{new_name}*" for new_name, _, old_name in updates])
