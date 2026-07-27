@@ -812,14 +812,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                     if isinstance(content, str) and content.startswith('🎙️ "') and content.endswith('"'):
                         _profile_name = "default"
                         try:
-                            import json as _json
-                            import os as _os
-                            routes_path = _os.path.expanduser("~/.hermes/plugins/whatsapp-profile-router/profile_routes.json")
-                            if _os.path.exists(routes_path):
-                                with open(routes_path, "r", encoding="utf-8") as rf:
-                                    _routes = _json.load(rf)
-                                if chat_id in _routes:
-                                    _profile_name = _routes[chat_id].get("profile") or "default"
+                            _profile_name = _route_for_chat(chat_id).get("profile") or "default"
                         except Exception:
                             pass
                             
@@ -1530,23 +1523,15 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
         # ---------------------------------------------------------
         # SILENT LISTENER LOGIC
         # ---------------------------------------------------------
+        # Single source of truth: config.yaml gateway.profile_routes with
+        # reply: true. (Formerly this was OR'd against the deprecated
+        # whatsapp-profile-router/profile_routes.json, which meant a route could
+        # reply even with reply: false / unset. reply is now authoritative.)
         whitelist = load_set_from_file(WHITELIST_FILE)
-        # DRY routing: treat any chat_id present in the router's profile_routes.json
-        # as whitelisted for the purpose of deciding whether Hermes should reply.
-        # This lets you edit only profile_routes.json.
-        routes_file = os.path.join(os.path.dirname(PLUGIN_DIR), "whatsapp-profile-router", "profile_routes.json")
-        routes_chat_ids = set()
-        try:
-            if os.path.exists(routes_file):
-                with open(routes_file, "r", encoding="utf-8") as rf:
-                    routes_data = json.load(rf)
-                if isinstance(routes_data, dict):
-                    routes_chat_ids = {str(k) for k in routes_data.keys() if str(k).strip()}
-        except Exception:
-            routes_chat_ids = set()
-        
+        routes_chat_ids = whitelist
+
         # Check if the chat itself (e.g. the group ID or DM ID) is whitelisted
-        is_whitelisted = (chat_id in whitelist) or (chat_id in routes_chat_ids)
+        is_whitelisted = chat_id in whitelist
 
         # In a group chat, we also allow the message if the user speaking is explicitly whitelisted
         if not is_whitelisted and user_aliases:

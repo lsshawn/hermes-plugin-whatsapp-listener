@@ -68,17 +68,11 @@ _name_cache_lock = threading.Lock()
 # groups in DIFFERENT profiles — so we emit NO profile claim for them and let
 # the hub derive per-chat profile from its own chat/session data. Hence the
 # wire carries `profiles` as a LIST (0..n), never a single value.
-#
-# Migration window: before you move the mappings into config.yaml, fall back to
-# the legacy whatsapp-profile-router/profile_routes.json so nothing goes blank.
 HERMES_HOME = os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
 CONFIG_YAML = os.path.join(HERMES_HOME, "config.yaml")
-LEGACY_ROUTES_JSON = os.path.join(
-    HERMES_HOME, "plugins", "whatsapp-profile-router", "profile_routes.json"
-)
 
 _routes_cache = {}        # {chat_id: profile}
-_routes_cache_key = None  # (config_mtime, legacy_mtime) — reparse only on change
+_routes_cache_key = None  # config.yaml mtime — reparse only on change
 _routes_lock = threading.Lock()
 
 
@@ -118,35 +112,17 @@ def _parse_config_routes():
     return out
 
 
-def _parse_legacy_routes():
-    """Return {chat_id: profile} from the old profile_routes.json (fallback)."""
-    try:
-        with open(LEGACY_ROUTES_JSON, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return {}
-    out = {}
-    if isinstance(data, dict):
-        for chat_id, meta in data.items():
-            profile = (meta or {}).get("profile") if isinstance(meta, dict) else None
-            if chat_id and profile:
-                out[str(chat_id)] = str(profile)
-    return out
-
-
 def load_routes():
-    """{chat_id: profile}, cached and reparsed only when a source file changes.
-    config.yaml wins; legacy JSON fills gaps during the migration window."""
+    """{chat_id: profile}, cached and reparsed only when config.yaml changes.
+    config.yaml gateway.profile_routes is the single source of truth."""
     global _routes_cache, _routes_cache_key
-    key = (_mtime(CONFIG_YAML), _mtime(LEGACY_ROUTES_JSON))
+    key = _mtime(CONFIG_YAML)
     with _routes_lock:
         if key == _routes_cache_key:
             return _routes_cache
-        merged = dict(_parse_legacy_routes())  # base
-        merged.update(_parse_config_routes())  # config.yaml overrides
-        _routes_cache = merged
+        _routes_cache = _parse_config_routes()
         _routes_cache_key = key
-        return merged
+        return _routes_cache
 
 
 def profiles_for_jid(jid):
