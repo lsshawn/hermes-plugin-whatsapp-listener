@@ -34,6 +34,7 @@ _MAX_QUEUE = 500          # bounded offline buffer (drop-oldest beyond this)
 _BACKOFF_MIN = 1.0        # seconds
 _BACKOFF_MAX = 30.0
 _PING_INTERVAL = 45.0     # app-level keepalive (hub also auto-responds at runtime)
+_CONFIG_POLL_INTERVAL = 5.0  # config.yaml mtime poll (cheap stat; edits are rare)
 
 _started = False
 _start_lock = threading.Lock()
@@ -117,6 +118,47 @@ def notify_new_message(chat_id, text=None, role="user", ts=None):
             "timestamp": int(ts if ts is not None else time.time()),
         }
     _enqueue("new_message", data)
+
+
+def notify_profiles_changed():
+    """config.yaml's gateway.profile_routes changed — tell the hub immediately.
+
+    Two-part, deliberately: the WS event is only a NUDGE (open tabs reload), while
+    the authoritative state travels over the existing HTTP push_profiles path. The
+    hub's ClientDO is a pure relay with no DB access, so it can't apply routes
+    itself. Without this, a config.yaml edit sat invisible until the ~hourly cron.
+    """
+    if _hub_sync is None or not _hub_sync.enabled():
+        return
+    # Authoritative snapshot first, so a tab reloading on the nudge already sees
+    # the new routing rather than re-reading stale rows.
+    try:
+        _hub_sync.push_profiles()
+    except Exception:
+        pass  # never fatal; the cron reconcile remains the backstop
+    _enqueue("profiles_changed", {})
+
+
+def _config_watch_loop():
+    """Poll config.yaml's mtime and fire notify_profiles_changed() on change.
+
+    Polling (not inotify) to stay dependency-free and match how hub_sync already
+    invalidates its own route cache. The first observation only seeds the
+    baseline — we must not push on startup, or every gateway restart would emit a
+    spurious change.
+    """
+    last = None
+    while True:
+        try:
+            mtime = os.path.getmtime(_hub_sync.CONFIG_YAML) if _hub_sync else None
+        except Exception:
+            mtime = None
+        if mtime is not None:
+            if last is not None and mtime != last:
+                print("[whatsapp-listener] config.yaml changed → pushing profiles to hub")
+                notify_profiles_changed()
+            last = mtime
+        time.sleep(_CONFIG_POLL_INTERVAL)
 
 
 def push_status(status, qr=None, bot_user=None):
@@ -252,4 +294,8 @@ def start(hub_sync=None):
             return
         t = threading.Thread(target=_thread_main, name="hub-push", daemon=True)
         t.start()
+        # Watch config.yaml so route edits reach the hub in seconds instead of
+        # waiting for the ~hourly push_profiles cron.
+        w = threading.Thread(target=_config_watch_loop, name="hub-config-watch", daemon=True)
+        w.start()
         print("[whatsapp-listener] hub push started (live WebSocket → hub)")
