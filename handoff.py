@@ -38,7 +38,11 @@ import urllib.error
 
 # --- config ----------------------------------------------------------------
 CLIENT_API_URL = (os.environ.get("CLIENT_API_URL") or "http://127.0.0.1:8787").rstrip("/")
-CLIENT_API_SECRET = os.environ.get("HUB_CLIENT_SECRET", "") or ""
+# CLIENT_API_SECRET is the canonical name; HUB_CLIENT_SECRET is the legacy
+# alias from the hub-era provisioning flow and still honored on old boxes.
+CLIENT_API_SECRET = (
+    os.environ.get("CLIENT_API_SECRET", "") or os.environ.get("HUB_CLIENT_SECRET", "") or ""
+)
 STATE_DB_PATH = os.environ.get("STATE_DB_PATH") or os.path.expanduser("~/.hermes/state.db")
 BRIDGE_URL = (os.environ.get("BRIDGE_URL") or "http://127.0.0.1:3000").rstrip("/")
 

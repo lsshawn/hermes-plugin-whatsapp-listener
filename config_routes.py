@@ -1,5 +1,5 @@
 """Single source of truth for WhatsApp per-chat config: read/write the root
-``~/.hermes/config.yaml`` (gateway.profile_routes + whatsapp_admins).
+``~/.hermes/config.yaml`` (gateway.profile_routes + whatsapp_admins + skills.disabled).
 
 This module REPLACES the plugin's old ``state.yaml``. Everything a chat needs —
 which profile serves it (``profile``), whether the bot replies (``reply``),
@@ -245,6 +245,49 @@ def remove_route(chat_id: str) -> bool:
         if idx is None:
             return False
         del routes[idx]
+        _dump_atomic(doc)
+        return True
+
+
+def get_skills_disabled() -> List[str]:
+    """Return the global ``skills.disabled`` list from config.yaml ([] if unset)."""
+    doc, _ = _load_raw()
+    skills = doc.get("skills") if isinstance(doc, dict) else None
+    if not isinstance(skills, dict):
+        return []
+    disabled = skills.get("disabled")
+    if isinstance(disabled, str):
+        disabled = [disabled]
+    return [str(x).strip() for x in (disabled or []) if str(x).strip()]
+
+
+def set_skills_disabled(names: List[str]) -> bool:
+    """Replace the global ``skills.disabled`` list. Returns True if a change was
+    persisted. Comment-preserving + atomic, same contract as the route writers.
+
+    Hermes core reads this list (agent/skill_utils.py get_disabled_skills), so a
+    write here takes effect on the gateway's next skills scan — no restart."""
+    new = sorted({str(x).strip() for x in names if str(x).strip()})
+    with _WRITE_LOCK:
+        doc, ok = _load_raw()
+        if not ok or not isinstance(doc, dict):
+            raise RuntimeError("cannot write config.yaml (ruamel unavailable or file unreadable)")
+        skills = doc.get("skills")
+        if not isinstance(skills, dict):
+            from ruamel.yaml.comments import CommentedMap
+            skills = CommentedMap()
+            doc["skills"] = skills
+        cur = skills.get("disabled")
+        if isinstance(cur, str):
+            cur = [cur]
+        cur_norm = sorted({str(x).strip() for x in (cur or []) if str(x).strip()})
+        if cur_norm == new:
+            return False
+        from ruamel.yaml.comments import CommentedSeq
+        seq = CommentedSeq()
+        for x in new:
+            seq.append(x)
+        skills["disabled"] = seq
         _dump_atomic(doc)
         return True
 
