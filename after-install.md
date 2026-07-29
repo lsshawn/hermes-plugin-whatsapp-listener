@@ -12,19 +12,29 @@ If it wasn't auto-enabled:
 hermes plugins enable whatsapp-listener
 ```
 
-Set `root_admin` (your WhatsApp number) in the plugin's `state.yaml` — this is the
-permanent admin that can run ops commands:
+Set your permanent admin (the number that can run ops commands) in the **root
+`~/.hermes/config.yaml`**:
+
+```yaml
+whatsapp_admins:
+  root: 60123456789@s.whatsapp.net
+  extra: []
+```
+
+> Superseded: this used to be `root_admin:` in the plugin's own `state.yaml`.
+> The DRY migration (`migrate_state_to_config.py`) moved it into `config.yaml`,
+> and `state.yaml` no longer drives anything — editing it appears to succeed and
+> silently has no effect. `config_routes.load_admins()`/`set_admins()` read and
+> write the block above.
+
+Then restart the gateway. It is a **system-scope** unit, so this needs `sudo`:
 
 ```
-~/.hermes/plugins/whatsapp-listener/state.yaml
-  root_admin: 60123456789@s.whatsapp.net
+sudo systemctl restart hermes-gateway
 ```
 
-Then restart the gateway:
-
-```
-systemctl --user restart hermes-gateway.service
-```
+(`systemctl --user` was correct only for the older user-scope unit; on a box set
+up by `scripts/setup-hardened-gateway.sh` it will report no such unit.)
 
 That's everything for a **standalone** WhatsApp bot. The hub bits below are
 optional — without them the plugin works fully and the relink watcher just
@@ -39,8 +49,12 @@ the hub, install the hub layer (systemd pull-timer + credentials):
 git clone git@github.com:lsshawn/cupbots-hub-sync.git
 cd cupbots-hub-sync
 HUB_CLIENT_SECRET=hubc_xxx ./install.sh
-systemctl --user restart hermes-gateway.service
+sudo systemctl restart hermes-gateway
 ```
+
+Note the pull layer writes the managed sections of **`config.yaml`** (via this
+plugin's `config_routes.py`), not `state.yaml` — cupbots-hub-sync's own README
+still describes the pre-migration behaviour.
 
 `HUB_CLIENT_SECRET` is shown once in the hub Admin when this client is registered.
 Requires cupbots-hub to expose the wa-status endpoints (recent release).

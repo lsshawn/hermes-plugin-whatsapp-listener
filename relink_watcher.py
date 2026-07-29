@@ -155,6 +155,16 @@ def _backup_and_clear_session():
     try:
         if not os.path.isdir(_SESSION_DIR):
             return None
+        # NEVER clear a session that still holds credentials. A bridge that is
+        # merely crashed/wedged (not logged out) keeps valid creds, and wiping
+        # them turns a recoverable outage into a lost pairing that only a manual
+        # QR scan can fix — and if nobody scans, the next loop wipes the fresh
+        # pairing too. Baileys only truly needs a clean dir when creds are gone
+        # or rejected, so gate on their presence.
+        if os.path.exists(os.path.join(_SESSION_DIR, "creds.json")):
+            print("[whatsapp-listener] session has creds.json — refusing to clear "
+                  "(bridge is crashed, not logged out); skipping relink")
+            return None
         # Timestamp without Date.now()-style helpers being unavailable here (this
         # is plain Python, so time.strftime is fine).
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -238,8 +248,20 @@ def _run_relink(hub_sync, port):
             return False
 
         # 1. Make sure no bot bridge holds the session/port, then reset session.
+        #    If the session still has creds the reset is refused — that means the
+        #    bridge is crashed rather than logged out, so restart it instead of
+        #    forcing a QR nobody is waiting to scan.
         _stop_bot_bridge(port)
-        _backup_and_clear_session()
+        if os.path.isdir(_SESSION_DIR) and os.path.exists(
+            os.path.join(_SESSION_DIR, "creds.json")
+        ):
+            if _backup_and_clear_session() is None:
+                print("[whatsapp-listener] relink: creds intact, restarting bot bridge "
+                      "instead of re-pairing")
+                _start_bot_bridge(port)
+                return False
+        else:
+            _backup_and_clear_session()
 
         # 2. Launch pair-only --pair-json (same invocation the dashboard uses).
         env = dict(os.environ)

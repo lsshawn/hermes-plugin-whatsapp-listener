@@ -31,3 +31,14 @@ def register(ctx) -> None:
         hub_push.start(_HUB_SYNC)
     except Exception as e:  # pragma: no cover - defensive
         print(f"[whatsapp-listener] hub push not started (ignored): {e}")
+
+    # Post-mortem failure scan: an OOM kill or hard crash leaves NO in-process
+    # trace (SIGKILL runs no handler), so the only way to report it is to look
+    # backward at the journal on the next startup. Runs once here and pushes any
+    # kill/failure events since the last scan to the hub, so a turn that died
+    # silently still shows up. Best-effort and never fatal.
+    try:
+        from . import error_scan
+        error_scan.scan_and_report(_HUB_SYNC)
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[whatsapp-listener] error scan not run (ignored): {e}")

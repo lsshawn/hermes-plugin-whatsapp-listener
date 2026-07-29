@@ -68,17 +68,11 @@ _name_cache_lock = threading.Lock()
 # groups in DIFFERENT profiles — so we emit NO profile claim for them and let
 # the hub derive per-chat profile from its own chat/session data. Hence the
 # wire carries `profiles` as a LIST (0..n), never a single value.
-#
-# Migration window: before you move the mappings into config.yaml, fall back to
-# the legacy whatsapp-profile-router/profile_routes.json so nothing goes blank.
 HERMES_HOME = os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
 CONFIG_YAML = os.path.join(HERMES_HOME, "config.yaml")
-LEGACY_ROUTES_JSON = os.path.join(
-    HERMES_HOME, "plugins", "whatsapp-profile-router", "profile_routes.json"
-)
 
 _routes_cache = {}        # {chat_id: profile}
-_routes_cache_key = None  # (config_mtime, legacy_mtime) — reparse only on change
+_routes_cache_key = None  # config.yaml mtime — reparse only on change
 _routes_lock = threading.Lock()
 
 
@@ -118,35 +112,17 @@ def _parse_config_routes():
     return out
 
 
-def _parse_legacy_routes():
-    """Return {chat_id: profile} from the old profile_routes.json (fallback)."""
-    try:
-        with open(LEGACY_ROUTES_JSON, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return {}
-    out = {}
-    if isinstance(data, dict):
-        for chat_id, meta in data.items():
-            profile = (meta or {}).get("profile") if isinstance(meta, dict) else None
-            if chat_id and profile:
-                out[str(chat_id)] = str(profile)
-    return out
-
-
 def load_routes():
-    """{chat_id: profile}, cached and reparsed only when a source file changes.
-    config.yaml wins; legacy JSON fills gaps during the migration window."""
+    """{chat_id: profile}, cached and reparsed only when config.yaml changes.
+    config.yaml gateway.profile_routes is the single source of truth."""
     global _routes_cache, _routes_cache_key
-    key = (_mtime(CONFIG_YAML), _mtime(LEGACY_ROUTES_JSON))
+    key = _mtime(CONFIG_YAML)
     with _routes_lock:
         if key == _routes_cache_key:
             return _routes_cache
-        merged = dict(_parse_legacy_routes())  # base
-        merged.update(_parse_config_routes())  # config.yaml overrides
-        _routes_cache = merged
+        _routes_cache = _parse_config_routes()
         _routes_cache_key = key
-        return merged
+        return _routes_cache
 
 
 def profiles_for_jid(jid):
@@ -335,6 +311,107 @@ def push_status(status, qr=None, bot_user=None):
         hub_push.push_status(status, qr=qr, bot_user=bot_user)
     except Exception:
         pass
+
+
+# --- agent errors (client -> hub), fire-and-forget -------------------------
+# Why this exists: when the agent fails mid-turn the user sees only SILENCE — no
+# reply in the chat and no signal anywhere. These pushes make failures visible in
+# cupbots-hub. Same fire-and-forget contract as everything else here: reporting an
+# error must NEVER raise, block, or become a second failure.
+
+ERROR_KINDS = ("exception", "oom", "crash", "delivery", "tool", "cron")
+
+_DETAIL_LIMIT = 20000   # hub caps at 20k; truncate here so it never 400s
+_SUMMARY_LIMIT = 500
+
+
+def _new_error_id():
+    """Opaque client-minted id. The hub inserts-or-ignores on it, so a retried
+    push is idempotent and can't duplicate a row."""
+    import uuid
+    return uuid.uuid4().hex[:32]
+
+
+def _post_errors(body):
+    try:
+        _request("POST", "/api/v1/agent-errors", body=body)
+    except Exception as e:
+        # Best effort. An unreachable hub must not turn one failure into two —
+        # the local journal/log still has the original error either way.
+        print("[hub_sync] error push failed (ignored):", e)
+
+
+def push_errors(errors, block=False):
+    """Report a batch of failures to the hub. Fire-and-forget by default.
+
+    Each error: {kind, summary, detail?, source?, profile?, platform?, chat_id?,
+    session_id?, occurred_at?, id?}. `kind` must be one of ERROR_KINDS.
+
+    `block=True` sends synchronously — use it from a shutdown/atexit path where a
+    daemon thread would be killed before the request goes out. Never raises.
+    """
+    if not _enabled or not errors:
+        return
+    now = int(time.time())
+    prepared = []
+    for e in errors:
+        try:
+            kind = str(e.get("kind") or "exception")
+            if kind not in ERROR_KINDS:
+                kind = "exception"
+            summary = str(e.get("summary") or "unknown error")[:_SUMMARY_LIMIT]
+            item = {
+                "id": e.get("id") or _new_error_id(),
+                "kind": kind,
+                "summary": summary,
+                "occurredAt": int(e.get("occurred_at") or now),
+            }
+            detail = e.get("detail")
+            if detail:
+                item["detail"] = str(detail)[:_DETAIL_LIMIT]
+            # camelCase on the wire (hub zod schema); snake_case in Python callers.
+            for src_key, wire_key in (
+                ("source", "source"), ("profile", "profile"), ("platform", "platform"),
+                ("chat_id", "chatId"), ("session_id", "sessionId"),
+            ):
+                v = e.get(src_key)
+                if v:
+                    item[wire_key] = str(v)[:128]
+            prepared.append(item)
+        except Exception:
+            continue  # a malformed report must not sink the whole batch
+    if not prepared:
+        return
+    body = {"errors": prepared[:100]}   # hub caps the batch at 100
+    if block:
+        _post_errors(body)
+    else:
+        threading.Thread(target=_post_errors, args=(body,), daemon=True).start()
+
+
+def push_error(kind, summary, detail=None, source=None, profile=None,
+               platform=None, chat_id=None, session_id=None, occurred_at=None,
+               block=False):
+    """Convenience: report a single failure. Never raises."""
+    push_errors([{
+        "kind": kind, "summary": summary, "detail": detail, "source": source,
+        "profile": profile, "platform": platform, "chat_id": chat_id,
+        "session_id": session_id, "occurred_at": occurred_at,
+    }], block=block)
+
+
+def push_exception(exc, summary=None, source=None, profile=None, **ctx):
+    """Report a caught exception with its traceback as detail. Never raises."""
+    import traceback
+    try:
+        tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    except Exception:
+        tb = repr(exc)
+    push_error(
+        "exception",
+        summary or f"{type(exc).__name__}: {exc}",
+        detail=tb, source=source, profile=profile, **ctx
+    )
 
 
 def push_state_section(section, jids, source="plugin"):

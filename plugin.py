@@ -137,15 +137,51 @@ def _refresh_routes_cache() -> None:
     _LISTENER_ROUTES_CACHE["admins"] = admins
 
 
+def _chat_id_candidates(chat_id: str) -> list:
+    """chat_id plus its WhatsApp identity aliases, most-specific first.
+
+    A DM's chat_id IS the peer's JID, and WhatsApp may deliver it in either the
+    phone form (``60123...@s.whatsapp.net``) or the newer LID form
+    (``2806...@lid``) for the SAME person. profile_routes stores one of them, so
+    a raw exact-match silently misses the other and the chat resolves to
+    'default' — running the wrong profile (see the block comment above). Group
+    JIDs (@g.us) are stable and never aliased, so they short-circuit.
+
+    Mirrors the alias expansion already used for admin identity below.
+    """
+    raw = str(chat_id)
+    if not raw or "@g.us" in raw:
+        return [raw]
+    out = [raw]
+    try:
+        from gateway.whatsapp_identity import expand_whatsapp_aliases
+        for alias in sorted(expand_whatsapp_aliases(raw)):
+            # expand_whatsapp_aliases returns bare identifiers; restore both
+            # suffix forms so either style of profile_routes entry matches.
+            for cand in (f"{alias}@s.whatsapp.net", f"{alias}@lid", alias):
+                if cand not in out:
+                    out.append(cand)
+    except Exception:
+        pass
+    return out
+
+
 def _route_for_chat(chat_id: str) -> dict:
     """Full route entry dict for a chat_id (reply/no_mention/paused/pause_reason/
     profile/...), or {} if unrouted. Cached on config.yaml mtime. This is the DRY
     single-source lookup that replaces state.yaml's reply_whitelist /
-    no_mention_groups / paused_chats sections."""
+    no_mention_groups / paused_chats sections.
+
+    Alias-aware: matches @lid and @s.whatsapp.net forms of the same DM peer."""
     if not chat_id:
         return {}
     _refresh_routes_cache()
-    return _LISTENER_ROUTES_CACHE.get("routes", {}).get(str(chat_id), {})
+    routes = _LISTENER_ROUTES_CACHE.get("routes", {})
+    for cand in _chat_id_candidates(chat_id):
+        hit = routes.get(cand)
+        if hit:
+            return hit
+    return {}
 
 
 def _wa_admins() -> dict:
@@ -175,7 +211,12 @@ def _profile_for_chat(chat_id: str) -> str:
     except OSError:
         return "default"
     _refresh_routes_cache()
-    return _LISTENER_ROUTES_CACHE["map"].get(chat_id, "default")
+    m = _LISTENER_ROUTES_CACHE["map"]
+    for cand in _chat_id_candidates(chat_id):
+        prof = m.get(cand)
+        if prof:
+            return prof
+    return "default"
 
 
 def _profile_key_kwarg(chat_id: str) -> dict:
@@ -220,15 +261,28 @@ def _group_safe_profiles() -> set:
     return _GROUPSAFE_CACHE["set"]
 
 
-def _profile_allowed_in_group(profile: str) -> bool:
+def _profile_allowed_in_group(profile: str, chat_id: str = "") -> bool:
     """True if `profile` may serve a GROUP chat. Unrestricted profiles are
     DM-only. 'default' is treated as group-safe here because its WhatsApp surface
     is separately locked (platform_toolsets: messaging-only) — but a group with no
-    route shouldn't reach the reply path anyway."""
+    route shouldn't reach the reply path anyway.
+
+    PER-ROUTE OPT-IN: a single group may be exempted by setting
+    ``group_safe: true`` on its gateway.profile_routes entry. Use ONLY for a
+    group the operator has verified is solo (no other humans) — an unrestricted
+    profile there has full terminal + filesystem reach, so a second member could
+    pull private data out of its replies. Scoped per chat_id ON PURPOSE: it does
+    NOT make the profile group-safe anywhere else, so a newly added group still
+    fails closed until explicitly vouched for.
+    """
     p = (profile or "default").strip().lower()
     if p == "default":
         return True
-    return p in _group_safe_profiles()
+    if p in _group_safe_profiles():
+        return True
+    if chat_id and _route_for_chat(chat_id).get("group_safe") is True:
+        return True
+    return False
 
 
 def _scoped_session_db(chat_id: str):
@@ -508,7 +562,49 @@ def _load_bot_identity_hint() -> dict:
         return {}
 
 
-_BOT_HINT = _load_bot_identity_hint()
+_BOT_HINT_CACHE = {"hint": {}, "mtime": None}
+
+
+def _bot_hint() -> dict:
+    """Bot identity, reloaded when creds.json changes.
+
+    Loading this once at import raced the WhatsApp bridge: on a boot where the
+    session dir is still empty (e.g. after a relink) the hint stayed {} for the
+    whole process lifetime, so every group mention-match silently failed until
+    someone restarted the gateway. Re-stat the file (cheap, mtime-gated) so a
+    late-written or re-paired creds.json is picked up on the next message.
+    """
+    try:
+        creds_path = os.path.join(
+            os.path.expanduser("~/.hermes"), "whatsapp", "session", "creds.json"
+        )
+        mtime = os.path.getmtime(creds_path) if os.path.exists(creds_path) else None
+    except Exception:
+        mtime = None
+    if mtime != _BOT_HINT_CACHE["mtime"] or (not _BOT_HINT_CACHE["hint"] and mtime):
+        _BOT_HINT_CACHE["hint"] = _load_bot_identity_hint()
+        _BOT_HINT_CACHE["mtime"] = mtime
+    return _BOT_HINT_CACHE["hint"]
+
+
+class _BotHintProxy(dict):
+    """Keeps the existing `_BOT_HINT.get(...)` call sites working while making
+    every read go through the mtime-checked loader above."""
+
+    def get(self, key, default=None):
+        return _bot_hint().get(key, default)
+
+    def __getitem__(self, key):
+        return _bot_hint()[key]
+
+    def __contains__(self, key):
+        return key in _bot_hint()
+
+    def __bool__(self):
+        return bool(_bot_hint())
+
+
+_BOT_HINT = _BotHintProxy()
 
 
 def _extract_mention_meta(event) -> dict:
@@ -653,8 +749,8 @@ def get_all_admins():
     return admins
 
 def load_paused_chats() -> dict:
-    """chat_id -> pause_reason for chats MANUALLY paused (route.paused: true).
-    Automated handoff-pause is separate (is_chat_in_handoff / concierge.db)."""
+    """chat_id -> pause_reason for chats paused via route.paused: true.
+    This is the ONLY pause source (config.yaml, authored in cupbots-hub)."""
     _refresh_routes_cache()
     routes = _LISTENER_ROUTES_CACHE.get("routes", {})
     out = {}
@@ -662,52 +758,6 @@ def load_paused_chats() -> dict:
         if r.get("paused") is True:
             out[cid] = r.get("pause_reason") or "paused"
     return out
-
-def is_chat_in_handoff(chat_id: str) -> tuple:
-    """Check if the chat has any open order in a handoff state.
-    Returns (is_in_handoff, reason_or_empty)
-    """
-    if not chat_id:
-        return False, ""
-    try:
-        db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
-        if not os.path.exists(db_path):
-            return False, ""
-        
-        import sqlite3
-        with sqlite3.connect(db_path) as conn:
-            conn.row_factory = sqlite3.Row
-            chat_norm = chat_id.split("@")[0]
-            
-            # Find client for this chat
-            client_row = conn.execute(
-                "SELECT id, business_name FROM clients WHERE whatsapp_chat_id = ? OR whatsapp_chat_id LIKE ?",
-                (chat_id, f"%{chat_norm}%")
-            ).fetchone()
-            
-            if client_row:
-                client_id = client_row["id"]
-                
-                # Check for an active handoff order
-                order_row = conn.execute(
-                    "SELECT id, status FROM orders WHERE client_id = ? AND (human_handoff = 1 OR status = 'handoff') "
-                    "ORDER BY updated_at DESC LIMIT 1",
-                    (client_id,)
-                ).fetchone()
-                
-                if order_row:
-                    # Let's find the audit note / reason
-                    audit_row = conn.execute(
-                        "SELECT note FROM order_audit_logs WHERE order_id = ? AND action = 'handoff' "
-                        "ORDER BY id DESC LIMIT 1",
-                        (order_row["id"],)
-                    ).fetchone()
-                    reason = audit_row["note"] if audit_row else "Flagged for handoff"
-                    return True, f"Order #{order_row['id']} handoff: {reason}"
-                    
-    except Exception:
-        pass
-    return False, ""
 
 def is_manually_paused(chat_id: str) -> tuple:
     try:
@@ -725,28 +775,13 @@ def _init_known_paused():
     if _KNOWN_PAUSED_CHATS:
         return
     try:
-        # 1. Manual pauses
+        # Pauses come ONLY from route.paused in config.yaml (see the pause note
+        # in on_pre_gateway_dispatch). The former app.db handoff scan was
+        # dropped 2026-07-28.
         paused_chats = load_paused_chats()
         for cid in paused_chats.keys():
             _KNOWN_PAUSED_CHATS.add(cid)
             _KNOWN_PAUSED_CHATS.add(cid.split("@")[0])
-        # 2. Database handoffs
-        db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
-        if os.path.exists(db_path):
-            import sqlite3
-            with sqlite3.connect(db_path) as conn:
-                conn.row_factory = sqlite3.Row
-                rows = conn.execute(
-                    "SELECT whatsapp_chat_id FROM clients c "
-                    "JOIN orders o ON o.client_id = c.id "
-                    "WHERE o.human_handoff = 1 OR o.status = 'handoff'"
-                ).fetchall()
-                for r in rows:
-                    if r["whatsapp_chat_id"]:
-                        _KNOWN_NORM = r["whatsapp_chat_id"].split("@")[0]
-                        _KNOWN_FULL = r["whatsapp_chat_id"]
-                        _KNOWN_PAUSED_CHATS.add(_KNOWN_FULL)
-                        _KNOWN_PAUSED_CHATS.add(_KNOWN_NORM)
     except Exception as e:
         print(f"[whatsapp-listener] Error pre-populating paused set: {e}")
 
@@ -812,14 +847,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                     if isinstance(content, str) and content.startswith('🎙️ "') and content.endswith('"'):
                         _profile_name = "default"
                         try:
-                            import json as _json
-                            import os as _os
-                            routes_path = _os.path.expanduser("~/.hermes/plugins/whatsapp-profile-router/profile_routes.json")
-                            if _os.path.exists(routes_path):
-                                with open(routes_path, "r", encoding="utf-8") as rf:
-                                    _routes = _json.load(rf)
-                                if chat_id in _routes:
-                                    _profile_name = _routes[chat_id].get("profile") or "default"
+                            _profile_name = _route_for_chat(chat_id).get("profile") or "default"
                         except Exception:
                             pass
                             
@@ -1017,23 +1045,23 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             if resume_session_match:
                 client_query = resume_session_match.group(1).strip()
                 title_name = resume_session_match.group(2).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (client_query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{client_query}%",)
                             ).fetchall()
                         
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(f"❌ *No active client found* matching '{client_query}'.\n\n💡 *Available client names:*\n{client_names_str}")
                         elif len(clients_db) > 1:
@@ -1091,7 +1119,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             
             elif pause_match:
                 query = pause_match.group(1).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
@@ -1099,17 +1127,17 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                         
                         # Find client
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{query}%",)
                             ).fetchall()
                             
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(
                                 f"❌ *No active client found* matching '{query}'.\n\n"
@@ -1140,7 +1168,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 
             elif resume_match:
                 query = resume_match.group(1).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
@@ -1148,17 +1176,17 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                         
                         # Find client
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{query}%",)
                             ).fetchall()
                             
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(
                                 f"❌ *No active client found* matching '{query}'.\n\n"
@@ -1193,23 +1221,23 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             
             elif new_session_match:
                 query = new_session_match.group(1).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{query}%",)
                             ).fetchall()
                         
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(f"❌ *No active client found* matching '{query}'.\n\n💡 *Available client names:*\n{client_names_str}")
                         elif len(clients_db) > 1:
@@ -1258,23 +1286,23 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             elif title_match:
                 client_query = title_match.group(1).strip()
                 title_name = title_match.group(2).strip()
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
                         clients_db = db_conn.execute(
-                            "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name = ?",
+                            "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name = ?",
                             (client_query,)
                         ).fetchall()
                         if not clients_db:
                             clients_db = db_conn.execute(
-                                "SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1 AND business_name LIKE ?",
+                                "SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1 AND display_name LIKE ?",
                                 (f"%{client_query}%",)
                             ).fetchall()
                         
                         if not clients_db:
-                            all_clients = db_conn.execute("SELECT business_name FROM clients WHERE is_active=1").fetchall()
+                            all_clients = db_conn.execute("SELECT display_name AS business_name FROM account WHERE is_active=1").fetchall()
                             client_names_str = "\n".join([f"• {c['business_name']}" for c in all_clients])
                             send_msg(f"❌ *No active client found* matching '{client_query}'.\n\n💡 *Available client names:*\n{client_names_str}")
                         elif len(clients_db) > 1:
@@ -1307,28 +1335,14 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 return {"action": "skip", "reason": "Intercepted admin group title command"}
                 
             elif paused_match:
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
                 try:
+                    # Pauses come ONLY from route.paused in config.yaml. The
+                    # app.db handoff scan was dropped 2026-07-28.
                     paused_chats = load_paused_chats()
-                    manual_lines = []
-                    for cid, bname in paused_chats.items():
-                        manual_lines.append(f"- *{bname}* (Manually Paused)")
-                        
-                    # Also look up database handoffs
-                    handoff_lines = []
-                    import sqlite3
-                    with sqlite3.connect(db_path) as db_conn:
-                        db_conn.row_factory = sqlite3.Row
-                        handoffs = db_conn.execute(
-                            "SELECT c.business_name, o.id, o.updated_at FROM orders o "
-                            "JOIN clients c ON o.client_id = c.id "
-                            "WHERE o.human_handoff = 1 OR o.status = 'handoff' "
-                            "ORDER BY o.updated_at DESC"
-                        ).fetchall()
-                        for h in handoffs:
-                            handoff_lines.append(f"- *{h['business_name']}* (Handoff State, Order #{h['id']})")
-                            
-                    all_lines = manual_lines + handoff_lines
+                    all_lines = []
+                    for cid, reason in paused_chats.items():
+                        all_lines.append(f"- *{cid}* ({reason})")
+
                     if not all_lines:
                         send_msg("🟢 *No AI chats are currently paused.* All bots are fully active.")
                     else:
@@ -1339,14 +1353,14 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                 return {"action": "skip", "reason": "Intercepted admin group paused list command"}
                 
             elif sync_match:
-                db_path = "/mnt/storage/projects/carbongpt/yltc-whatsapp-ordering-ai/data/concierge.db"
+                db_path = os.environ.get('APP_DB', '/mnt/storage/projects/company-os/data/yltc-profile.db')
                 try:
                     import sqlite3
                     import urllib.request
                     
                     with sqlite3.connect(db_path) as db_conn:
                         db_conn.row_factory = sqlite3.Row
-                        rows = db_conn.execute("SELECT id, business_name, whatsapp_chat_id FROM clients WHERE is_active=1").fetchall()
+                        rows = db_conn.execute("SELECT id, display_name AS business_name, whatsapp_chat_id FROM account WHERE is_active=1").fetchall()
                         
                         updates = []
                         for r in rows:
@@ -1371,7 +1385,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
                             send_msg("🔄 *WhatsApp group sync complete.*\nAll database client names are already perfectly aligned with your active WhatsApp groups!")
                         else:
                             for new_name, cid, old_name in updates:
-                                db_conn.execute("UPDATE clients SET business_name=? WHERE id=?", (new_name, cid))
+                                db_conn.execute("UPDATE account SET display_name=? WHERE id=?", (new_name, cid))
                             db_conn.commit()
                             
                             updates_str = "\n".join([f"- *{old_name}* ➔ *{new_name}*" for new_name, _, old_name in updates])
@@ -1530,23 +1544,15 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
         # ---------------------------------------------------------
         # SILENT LISTENER LOGIC
         # ---------------------------------------------------------
+        # Single source of truth: config.yaml gateway.profile_routes with
+        # reply: true. (Formerly this was OR'd against the deprecated
+        # whatsapp-profile-router/profile_routes.json, which meant a route could
+        # reply even with reply: false / unset. reply is now authoritative.)
         whitelist = load_set_from_file(WHITELIST_FILE)
-        # DRY routing: treat any chat_id present in the router's profile_routes.json
-        # as whitelisted for the purpose of deciding whether Hermes should reply.
-        # This lets you edit only profile_routes.json.
-        routes_file = os.path.join(os.path.dirname(PLUGIN_DIR), "whatsapp-profile-router", "profile_routes.json")
-        routes_chat_ids = set()
-        try:
-            if os.path.exists(routes_file):
-                with open(routes_file, "r", encoding="utf-8") as rf:
-                    routes_data = json.load(rf)
-                if isinstance(routes_data, dict):
-                    routes_chat_ids = {str(k) for k in routes_data.keys() if str(k).strip()}
-        except Exception:
-            routes_chat_ids = set()
-        
+        routes_chat_ids = whitelist
+
         # Check if the chat itself (e.g. the group ID or DM ID) is whitelisted
-        is_whitelisted = (chat_id in whitelist) or (chat_id in routes_chat_ids)
+        is_whitelisted = chat_id in whitelist
 
         # In a group chat, we also allow the message if the user speaking is explicitly whitelisted
         if not is_whitelisted and user_aliases:
@@ -1698,10 +1704,15 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
         if is_group and mentions_other_user:
             should_reply = False
 
-        # Check manual pause and database handoff state
+        # Pause state. SINGLE SOURCE OF TRUTH: route.paused in config.yaml
+        # (authored in cupbots-hub, synced down). The old second gate — an
+        # app.db query for orders with human_handoff=1 OR status='handoff' —
+        # was retired 2026-07-28: it muted a chat indefinitely with no
+        # operator-visible signal, and matched human_handoff=1 even on
+        # already-resolved (confirmed/cancelled) orders, so a single stale
+        # escalation silenced the group forever. To mute a chat now, set
+        # paused: true on its gateway.profile_routes entry.
         is_paused, pause_reason = is_manually_paused(chat_id)
-        if not is_paused:
-            is_paused, pause_reason = is_chat_in_handoff(chat_id)
 
         chat_norm = chat_id.split("@")[0] if chat_id else ""
 
@@ -1761,7 +1772,7 @@ def on_pre_gateway_dispatch(event, gateway, session_store, **kwargs):
             # Only fs-allowlisted profiles (cgpt, yltc) or default (separately
             # locked) may serve groups; unrestricted profiles are DM-only. This
             # holds even for an admin @mention. Fall through to silent-save.
-            if is_group and not _profile_allowed_in_group(_resolved_profile):
+            if is_group and not _profile_allowed_in_group(_resolved_profile, chat_id):
                 print(
                     f"[whatsapp-listener] BLOCKED reply: profile '{_resolved_profile}' "
                     f"is not group-safe (unrestricted); chat={chat_id}. "

@@ -22,3 +22,5 @@ _migrated_backup/
 
 # Internal design/status notes (may reference this box's admin jid).
 DESIGN-dry-config.md
+*.bak
+*.superseded-by-*
